@@ -205,6 +205,36 @@ static inline int vx_remote_fetch(int fd, uint64_t handle, void *dst,
   return rc == VX_TRANSPORT_OK && got == nbytes;
 }
 
+/// The bytes from a view's first element to one past the last element it can
+/// reach: `(1 + sum((sizes[d] - 1) * strides[d])) * element size`.
+///
+/// Returns 0 for a view that cannot be staged: a view with a zero size, a
+/// negative stride, or a span that does not fit in 64 bits. A view with padded
+/// rows reaches fewer elements than `sizes[0] * strides[0]`, and copying that
+/// many reads and writes past the view.
+static inline uint64_t vx_remote_view_bytes(const int64_t *sizes,
+                                            const int64_t *strides,
+                                            int32_t rank, int32_t elem) {
+  uint64_t last = 0; /* the index of the last element the view reaches */
+  uint64_t count, bytes;
+  for (int32_t d = 0; d < rank; ++d) {
+    uint64_t step;
+    if (sizes[d] <= 0 || strides[d] < 0) {
+      return 0;
+    }
+    if (__builtin_mul_overflow((uint64_t)(sizes[d] - 1), (uint64_t)strides[d],
+                               &step) ||
+        __builtin_add_overflow(last, step, &last)) {
+      return 0;
+    }
+  }
+  if (__builtin_add_overflow(last, (uint64_t)1, &count) ||
+      __builtin_mul_overflow(count, (uint64_t)vx_dtype_bytes(elem), &bytes)) {
+    return 0;
+  }
+  return bytes;
+}
+
 /// Turn a local argument list into wire arguments.
 ///
 /// The inverse of vx_agent.h's rebuild, and the reason a memref's *handle* is
@@ -262,11 +292,17 @@ static inline int vx_remote_encode_args(int fd, void **device_args,
         const int64_t *strides = vx_memref_strides(inner, rank);
         uint64_t handle = (uint64_t)(uintptr_t)vx_memref_data(inner, elem);
         if (!vx_remote_addr_is_handle(handle)) {
-          uint64_t span =
-              rank > 0 ? (uint64_t)sizes[0] * (uint64_t)strides[0] : 1;
+          uint64_t bytes = vx_remote_view_bytes(sizes, strides, rank, elem);
+          if (bytes == 0) {
+            fprintf(stderr,
+                    "[Vx remote] cannot stage argument %lld: its view "
+                    "is empty, has a negative stride, or is too "
+                    "large\n",
+                    (long long)i);
+            return 0;
+          }
           handle = vx_remote_transfer(fd, (const void *)(uintptr_t)handle,
-                                      span * (uint64_t)vx_dtype_bytes(elem),
-                                      elem, scratch, scratch_len);
+                                      bytes, elem, scratch, scratch_len);
           if (handle == 0) {
             return 0;
           }
@@ -306,12 +342,17 @@ static inline int vx_remote_encode_args(int fd, void **device_args,
       handle = (uint64_t)(uintptr_t)vx_memref_data(desc, elem);
 
       if (!vx_remote_addr_is_handle(handle)) {
-        /* Local memory. Stage the whole extent the descriptor spans, so a
-           strided view arrives with the rows it refers to rather than only the
-           elements it touches, and its strides still mean what they said. */
-        uint64_t span =
-            rank > 0 ? (uint64_t)sizes[0] * (uint64_t)strides[0] : 1;
-        uint64_t bytes = span * (uint64_t)vx_dtype_bytes(elem);
+        /* Local memory. Stage every element from the first one the view
+           reaches to the last one, so its strides still mean what they said
+           on the worker. */
+        uint64_t bytes = vx_remote_view_bytes(sizes, strides, rank, elem);
+        if (bytes == 0) {
+          fprintf(stderr,
+                  "[Vx remote] cannot stage argument %lld: its view "
+                  "is empty, has a negative stride, or is too large\n",
+                  (long long)i);
+          return 0;
+        }
         handle = vx_remote_transfer(fd, (const void *)(uintptr_t)handle, bytes,
                                     elem, scratch, scratch_len);
         if (handle == 0) {
@@ -332,7 +373,7 @@ static inline int vx_remote_encode_args(int fd, void **device_args,
 }
 
 /// Copy argument `i` back from the worker copy `handle` into the host buffer
-/// that vx_remote_encode_args staged it from. Uses the same span as staging.
+/// that vx_remote_encode_args staged it from. Copies the same bytes as staging.
 static inline int vx_remote_fetch_staged(int fd, void **device_args,
                                          const int32_t *arg_tags, int64_t i,
                                          uint64_t handle) {
@@ -344,9 +385,9 @@ static inline int vx_remote_fetch_staged(int fd, void **device_args,
   int32_t rank = (int32_t)VX_ABI_RANK(arg_tags[i]);
   const int64_t *sizes = vx_memref_sizes(desc);
   const int64_t *strides = vx_memref_strides(desc, rank);
-  uint64_t span = rank > 0 ? (uint64_t)sizes[0] * (uint64_t)strides[0] : 1;
-  uint64_t bytes = span * (uint64_t)vx_dtype_bytes(elem);
-  return vx_remote_fetch(fd, handle, vx_memref_data(desc, elem), bytes);
+  uint64_t bytes = vx_remote_view_bytes(sizes, strides, rank, elem);
+  return bytes != 0 &&
+         vx_remote_fetch(fd, handle, vx_memref_data(desc, elem), bytes);
 }
 
 static inline int vx_remote_was_staged(const uint64_t *staged,
