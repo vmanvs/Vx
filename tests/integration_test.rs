@@ -39,6 +39,7 @@ mod integration_test {
     mod pipeline_scale_test;
     mod registry_test;
     mod remote_client_test;
+    mod remote_kernel_output_test;
     mod remote_region_test;
     mod resolution_test;
     mod shipped_programs_compile;

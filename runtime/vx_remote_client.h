@@ -331,6 +331,34 @@ static inline int vx_remote_encode_args(int fd, void **device_args,
   return 1;
 }
 
+/// Copy argument `i` back from the worker copy `handle` into the host buffer
+/// that vx_remote_encode_args staged it from. Uses the same span as staging.
+static inline int vx_remote_fetch_staged(int fd, void **device_args,
+                                         const int32_t *arg_tags, int64_t i,
+                                         uint64_t handle) {
+  const void *desc = *(const void **)device_args[i];
+  if (VX_ABI_IS_SLOT(arg_tags[i])) {
+    desc = vx_memref_aligned(desc);
+  }
+  int32_t elem = (int32_t)VX_ABI_ELEM(arg_tags[i]);
+  int32_t rank = (int32_t)VX_ABI_RANK(arg_tags[i]);
+  const int64_t *sizes = vx_memref_sizes(desc);
+  const int64_t *strides = vx_memref_strides(desc, rank);
+  uint64_t span = rank > 0 ? (uint64_t)sizes[0] * (uint64_t)strides[0] : 1;
+  uint64_t bytes = span * (uint64_t)vx_dtype_bytes(elem);
+  return vx_remote_fetch(fd, handle, vx_memref_data(desc, elem), bytes);
+}
+
+static inline int vx_remote_was_staged(const uint64_t *staged,
+                                       int64_t num_staged, uint64_t handle) {
+  for (int64_t s = 0; s < num_staged; ++s) {
+    if (staged[s] == handle) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
 /// Send a dispatch and apply whatever it published back into the caller's
 /// slots. Returns 0 when the worker declined, which the caller must treat as
 /// "run it here" rather than as a failure.
@@ -411,30 +439,24 @@ static inline int vx_remote_dispatch(int fd, const void *payload,
       const char *roles =
           vx_payload_field(payload, (size_t)payload_len, "roles=");
       int ai = -1, bi = -1, oi = -1;
-      int staged_here = 0;
       if (roles && vx_parse_roles(roles, &ai, &bi, &oi) && oi >= 0 &&
-          oi < num_args && args[oi].handle != 0) {
-        for (int64_t s = 0; s < num_staged; ++s) {
-          if (staged[s] == args[oi].handle) {
-            staged_here = 1;
-            break;
-          }
+          oi < num_args && args[oi].handle != 0 &&
+          vx_remote_was_staged(staged, num_staged, args[oi].handle)) {
+        if (!vx_remote_fetch_staged(fd, device_args, arg_tags, oi,
+                                    args[oi].handle)) {
+          return 0;
         }
       }
-      if (staged_here) {
-        const void *desc = *(const void **)device_args[oi];
-        if (VX_ABI_IS_SLOT(arg_tags[oi])) {
-          desc = vx_memref_aligned(desc);
-        }
-        int32_t elem = (int32_t)VX_ABI_ELEM(arg_tags[oi]);
-        int32_t rank = (int32_t)VX_ABI_RANK(arg_tags[oi]);
-        const int64_t *sizes = vx_memref_sizes(desc);
-        const int64_t *strides = vx_memref_strides(desc, rank);
-        uint64_t span =
-            rank > 0 ? (uint64_t)sizes[0] * (uint64_t)strides[0] : 1;
-        uint64_t bytes = span * (uint64_t)vx_dtype_bytes(elem);
-        if (!vx_remote_fetch(fd, args[oi].handle, vx_memref_data(desc, elem),
-                             bytes)) {
+    } else if (vx_payload_field(payload, (size_t)payload_len, "image=")) {
+      /* A kernel the compiler generated. Its payload does not say which
+         arguments it writes, so every buffer this call staged is read back.
+         An input comes back unchanged, which costs one fetch. Routing sends
+         this kind of dispatch only when it has no publication slot. */
+      for (int64_t i = 0; i < num_args; ++i) {
+        if (args[i].handle != 0 &&
+            vx_remote_was_staged(staged, num_staged, args[i].handle) &&
+            !vx_remote_fetch_staged(fd, device_args, arg_tags, i,
+                                    args[i].handle)) {
           return 0;
         }
       }
