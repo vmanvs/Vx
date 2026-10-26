@@ -1,0 +1,18 @@
+// The reviewer's program. `out` and `x` are host tensors, and the program does
+// not call `transfer`. On the fleet machines we expect error E6003.
+fn double(out : &mut Tensor<f32, [?]>, x : &Tensor<f32, [?]>, n : i32) -> void {
+  spawn on(Topology::Device) {
+    for i in 0..n across blocks {
+      out[i] = 2.0 * x[i];
+    }
+  }
+  return;
+}
+
+fn main() -> i32 {
+  let x = Tensor<f32, [4]>::fill(3.0);
+  let mut out = Tensor<f32, [4]>::fill(0.0);
+  double(&mut out, &x, 4);
+  println!("{} {} {} {}", out[0], out[1], out[2], out[3]);
+  return 0;
+}

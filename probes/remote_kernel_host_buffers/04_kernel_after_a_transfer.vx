@@ -1,0 +1,22 @@
+// The program the reviewer says works: `transfer` both tensors to HBM, run the
+// kernel, and `transfer` the result home. The launch should carry `image=`,
+// and its tensor arguments are the results of `transfer`, not host pointers.
+fn double(out : &mut Tensor<f32, [?], Memory::HBM>, x : &Tensor<f32, [?], Memory::HBM>, n : i32) -> void {
+  spawn on(Topology::Device) {
+    for i in 0..n across blocks {
+      out[i] = 2.0 * x[i];
+    }
+  }
+  return;
+}
+
+fn main() -> i32 {
+  let x = Tensor<f32, [4]>::fill(3.0);
+  let out = Tensor<f32, [4]>::fill(0.0);
+  let xd = transfer(x, Memory::HBM);
+  let mut od = transfer(out, Memory::HBM);
+  double(&mut od, &xd, 4);
+  let back = transfer(od, Memory::CPU_DRAM);
+  println!("{} {} {} {}", back[0], back[1], back[2], back[3]);
+  return 0;
+}

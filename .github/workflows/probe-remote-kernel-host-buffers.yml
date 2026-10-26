@@ -1,0 +1,72 @@
+name: Probe remote kernel host buffers
+
+# A throwaway workflow for PR #2235. It builds vxc and compiles the programs in
+# probes/remote_kernel_host_buffers/. Delete the branch when the probe is done.
+on:
+  push:
+    branches: [ 'probe/remote-kernel-host-buffers' ]
+  workflow_dispatch:
+
+jobs:
+  llvm:
+    name: Build LLVM
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    outputs:
+      key: ${{ steps.llvm.outputs.key }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build LLVM if the cache does not have it
+        id: llvm
+        uses: ./.github/actions/build-own-llvm
+        with:
+          restore: 'false'
+
+  probe:
+    name: Build vxc and compile the probes
+    needs: llvm
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: "-C link-arg=-fuse-ld=lld"
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ needs.llvm.outputs.key }}
+
+      - name: Use our own LLVM
+        uses: ./.github/actions/use-own-llvm
+        with:
+          key: ${{ needs.llvm.outputs.key }}
+
+      - name: Build vxc
+        run: cargo build --release --bin vxc
+
+      - name: Compile the probes
+        run: bash probes/remote_kernel_host_buffers/run.sh | tee probe-report.txt
+
+      - name: Show the report in the job summary
+        if: always()
+        run: |
+          {
+            echo '```'
+            cat probe-report.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the IR and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: probe-output
+          path: |
+            probe-report.txt
+            probes/remote_kernel_host_buffers/out/

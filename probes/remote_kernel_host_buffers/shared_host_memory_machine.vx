@@ -1,0 +1,20 @@
+// A GPU that shares host memory, as on a Grace Hopper machine. Host memory is
+// `managed: cached`, and the checker lets a GPU use a value in a cached space
+// with no `transfer`. Only the parts the probes need are here.
+Memory CPU_DRAM {
+  capacity: 480 GiB, bandwidth: 500 GB/s, managed: cached
+}
+
+Memory HBM {
+  capacity: 96 GiB, bandwidth: 4 TB/s, managed: explicit, scope: device
+}
+
+Topology Device {
+  arch: nvptx64,
+  levels: [blocks(max_lanes: 1024, memory: cta), subgroups(lanes: 32), lanes(memory: thread)],
+  chip: sm_90,
+  memory: Memory::HBM,
+  visible: [Memory::HBM],
+  transfer Memory::CPU_DRAM -> Memory::HBM : 450 GB/s,
+  transfer Memory::HBM -> Memory::CPU_DRAM : 450 GB/s
+}
