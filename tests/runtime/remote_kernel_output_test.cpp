@@ -15,6 +15,8 @@
 //
 //   * A kernel the compiler generated (the payload carries `image=`) writes two
 //     host buffers. Both must hold the kernel's values afterwards.
+//     tests/backend/pass/gpu_that_shares_host_memory_gets_host_tensors.vx
+//     is a program that compiles to this launch.
 //   * The same kernel, with one output already on the worker. That output must
 //     stay on the worker, and the other output must still reach the host.
 //   * A matmul with `outkind=buffer`, which fills one host buffer.
