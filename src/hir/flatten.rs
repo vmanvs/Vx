@@ -291,6 +291,35 @@ fn stmt_kind(s: &Statement) -> &'static str {
     }
 }
 
+/// Stop recursive generic declarations whose type arguments continually grow.
+const MAX_LAYOUT_RESOLUTION_DEPTH: usize = 128;
+
+/// The declaration and normalized type arguments that identify a layout.
+#[derive(Clone, Debug)]
+struct ConcreteLayoutIdentity {
+    declaration: TypeId,
+    arguments: Vec<Type>,
+}
+
+impl ConcreteLayoutIdentity {
+    fn semantically_eq(
+        &self,
+        other: &Self,
+        identities: &crate::layout::identity::AggregateIdentities,
+    ) -> bool {
+        self.declaration == other.declaration
+            && self.arguments.len() == other.arguments.len()
+            && self
+                .arguments
+                .iter()
+                .zip(&other.arguments)
+                .all(|(left, right)| {
+                    matches!((identities.type_key(left), identities.type_key(right)),
+                    (Some(left), Some(right)) if left == right)
+                })
+    }
+}
+
 /// The type of a lowered value: a primitive scalar, or an aggregate nominal (struct/enum) named by
 /// its GID. Aggregates size their `Alloca` from the frozen-registry layout (#199); scalar ops
 /// (`Add`/`Cmp`/`Cast`) apply only to `Scalar`. This is what the flat *type stream* carries per
@@ -417,11 +446,14 @@ struct Lowerer<'r> {
     agg_layout_indices: HashMap<TypeId, usize>,
     /// This function's inline `mlir!` blocks, handed to the worker as `local_inline_blocks`.
     inline_blocks: Vec<InlineBlock>,
-    /// A generic struct whose layout depends on its arguments (`Array<T, const N> { val: T }`):
-    /// its base layout in the registry is a stub, so each instance's is synthesized here, keyed by
-    /// `struct_instance_gid`, and read through `layout_of` wherever a layout is read by GID. The
-    /// emitter gets the same entries through `agg_layouts`.
+    /// Complete worker-local aggregate layouts used for allocation and field access.
+    /// Non-generic structs retain their nominal IDs. Generic instances use their concrete IDs.
+    /// The emitter receives the corresponding records through `agg_layouts`.
     instance_layouts: HashMap<TypeId, crate::registry::TypeDefinition>,
+    /// Structural identities of completed layouts, checked before cache reuse.
+    completed_layout_identities: HashMap<TypeId, ConcreteLayoutIdentity>,
+    /// Layout IDs and structural identities whose fields are currently being resolved.
+    resolving_layouts: Vec<(TypeId, ConcreteLayoutIdentity)>,
     /// The function's lowered return type, for a `return <match>` whose arms `return` themselves:
     /// the match's fall-through merge block needs a terminator, so it returns a default (zero) value of
     /// this type — mirroring the AST codegen's default-return merge block (`Option::unwrap`). (#242)
@@ -523,6 +555,8 @@ impl<'r> Lowerer<'r> {
             agg_layout_indices: HashMap::new(),
             inline_blocks: Vec::new(),
             instance_layouts: HashMap::new(),
+            completed_layout_identities: HashMap::new(),
+            resolving_layouts: Vec::new(),
             ret_ty: None,
             ret_void: false,
             materialized: HashSet::new(),
@@ -1708,6 +1742,18 @@ impl<'r> Lowerer<'r> {
                 self.lower_if_into_slot(if_expr, slot.reg)?;
                 Ok(self.emit_typed(Opcode::SlotLoad, slot.reg, Register(0), result_ty, 0))
             }
+            // A `match` used as a value, such as a return value, local initializer, or call argument.
+            // Infer its result type from an arm's trailing expression and allocate a result slot.
+            // Generate branches that store the selected arm's value, then load the result.
+            // An arm with an explicit `return` leaves the function directly without storing a value.
+            Expr::Match(m) => {
+                let result_ty = self.infer_expr_ty(e).ok_or(Decline::TypeNotModelled {
+                    what: "a match arm whose type cannot be inferred",
+                })?;
+                let slot = self.emit_alloca(result_ty.clone());
+                self.lower_match_with_result(m, Some(slot.reg))?;
+                Ok(self.emit_typed(Opcode::SlotLoad, slot.reg, Register(0), result_ty, 0))
+            }
             // A string literal in value position (`let s = "…"`, a string function argument): emit the
             // module-level global + `addressof`, yielding a first-class `!llvm.ptr` value — the same
             // shape the AST path's `StringLiteralExpr` produces. Backs the string-passing FFI programs
@@ -1807,13 +1853,15 @@ impl<'r> Lowerer<'r> {
         }
     }
 
-    /// Infer the [`LoweredTy`] of an expression from the AST + current scope, *without emitting* — so
-    /// the result slot of a value-position `if` can be sized before its branches are lowered (#229).
-    /// Covers the scalar-producing forms that appear as a branch's trailing value; anything else
-    /// returns `None`, declining the value-`if`.
-    fn infer_expr_ty(&self, e: &Expr) -> Option<LoweredTy> {
+    /// Infer an expression's HIR type without generating instructions, so branch result storage can be sized.
+    /// Record an enum's layout when needed. Return `None` for expressions whose type cannot be inferred.
+    fn infer_expr_ty(&mut self, e: &Expr) -> Option<LoweredTy> {
         match e {
             Expr::Number(n) => Some(LoweredTy::Scalar(number_elem(n)?)),
+            Expr::EnumVariant(ev) => self.lower_ty_synth(&enum_construct_type(ev)?),
+            Expr::Identifier(id) if matches!(id.name.as_ref(), "true" | "false") => {
+                Some(LoweredTy::Scalar(ElementType::Bool))
+            }
             Expr::Identifier(id) => match self.scope.get(&id.name)? {
                 Binding::Reg(v) => Some(v.ty.clone()),
                 Binding::Slot { ty, .. } => Some(ty.clone()),
@@ -1835,12 +1883,17 @@ impl<'r> Lowerer<'r> {
             }
             Expr::UnaryOp(u) => self.infer_expr_ty(&u.expr),
             Expr::RelationalOp(_) => Some(LoweredTy::Scalar(ElementType::Bool)),
+            Expr::LogicalOp(_) => Some(LoweredTy::Scalar(ElementType::Bool)),
+            Expr::StructInit(si) => {
+                lowered_ty(&Type::Struct(si.name.clone(), si.type_id), self.registry)
+            }
             Expr::Topology(_) => Some(LoweredTy::Scalar(ElementType::I32)),
             Expr::AsCast(c) => Some(LoweredTy::Scalar(scalar_of(&c.target_ty)?)),
             Expr::FunctionCall(fc) => {
                 let sig = self.registry.fn_sigs.get(&fc.name)?;
                 lowered_ty(&sig.ret_ty, self.registry)
             }
+            Expr::Match(m) => m.arms.iter().find_map(|arm| self.infer_block_ty(&arm.body)),
             Expr::If(iff) => self.infer_block_ty(comptime_survivor(iff).unwrap_or(&iff.then_block)),
             // `t.extent(k)`, as the checker rewrites it: an `i32`, as `lower_expr` emits it.
             Expr::IndexAccess(ix) if matches!(&*ix.base, Expr::MemberAccess(ma) if ma.member.as_ref() == "$extent") => {
@@ -1869,7 +1922,7 @@ impl<'r> Lowerer<'r> {
     }
 
     /// The inferred type of a block's trailing semicolon-less value expression (a branch's value).
-    fn infer_block_ty(&self, stmts: &[Statement]) -> Option<LoweredTy> {
+    fn infer_block_ty(&mut self, stmts: &[Statement]) -> Option<LoweredTy> {
         match stmts.last()? {
             Statement::ExprStmt(es) if !es.has_semi => self.infer_expr_ty(&es.expr),
             _ => None,
@@ -2155,6 +2208,7 @@ impl<'r> Lowerer<'r> {
         cond: Register,
         arm: &crate::syntax::MatchArm,
         merge: u32,
+        result: Option<Register>,
     ) -> Lowered<()> {
         let body_b = self.new_block();
         let next_b = self.new_block();
@@ -2165,7 +2219,7 @@ impl<'r> Lowerer<'r> {
             pack_targets(body_b, next_b),
         );
         self.emit_effect(Opcode::BlockStart, Register(0), Register(0), body_b as u64);
-        self.lower_block(&arm.body)?;
+        self.lower_match_arm(&arm.body, result)?;
         if !self.block_terminated() {
             self.emit_effect(Opcode::Br, Register(0), Register(0), merge as u64);
         }
@@ -2173,13 +2227,43 @@ impl<'r> Lowerer<'r> {
         Ok(())
     }
 
+    // The checker makes every value match exhaustive, so no path reaches this guard.
+    fn emit_missing_match_value_guard(&mut self) {
+        let cond = self.emit_value(
+            Opcode::Const,
+            Register(0),
+            Register(0),
+            ElementType::Bool,
+            0,
+        );
+        let message = self.strings.len() as u64;
+        self.strings
+            .push("no match arm produced a value".to_string());
+        self.emit_effect(Opcode::Abort, cond.reg, Register(0), message);
+    }
+
+    fn lower_match_arm(&mut self, body: &[Statement], result: Option<Register>) -> Lowered<()> {
+        match result {
+            Some(slot) => self.lower_statements_into_slot(body, slot),
+            None => self.lower_block(body),
+        }
+    }
+
     /// Lower a *statement-form* `match <subject> { <arms> }` over a payload-free enum (#227). The
     /// subject is an `i32` discriminant; each `EnumVariant` arm becomes a `cmp subject == ordinal` +
     /// conditional branch to the arm body (taken) or the next arm's test (else) — the same eq-compare
     /// chain the AST codegen emits; a literal arm over an integer subject is the same chain. A
     /// `Wildcard` arm is the unconditional default, and so is an identifier arm, with the subject
-    /// bound under the name. Payload bindings and value-producing `match` decline.
+    /// bound under the name.
     fn lower_match(&mut self, m: &crate::syntax::MatchExpr) -> Lowered<()> {
+        self.lower_match_with_result(m, None)
+    }
+
+    fn lower_match_with_result(
+        &mut self,
+        m: &crate::syntax::MatchExpr,
+        result: Option<Register>,
+    ) -> Lowered<()> {
         // A data-carrying enum match (`match o { Option<i32>::Some(v) => .. None => .. }`, #242): the
         // subject is a `{ tag, payload }` aggregate, dispatched on its tag field. Detected from the
         // first `EnumVariant` pattern naming an enum with a payload-carrying variant.
@@ -2199,13 +2283,13 @@ impl<'r> Lowerer<'r> {
             let enum_ty = self
                 .infer_ast_type(&m.expr)
                 .unwrap_or_else(|| Type::Enum(pattern_en.into(), None));
-            return self.lower_data_match(m, deref_to_pointee(&enum_ty));
+            return self.lower_data_match(m, deref_to_pointee(&enum_ty), result);
         }
         let subj = self.lower_expr(&m.expr)?;
         if !matches!(subj.ty, LoweredTy::Scalar(ElementType::I32)) {
             return Err(Decline::Unsupported {
-                what: "a match over an enum that carries a payload",
-            }); // only payload-free enums (a bare i32 discriminant)
+                what: "a match subject that is not represented as an i32",
+            });
         }
         let merge = self.new_block();
         // Each arm is a block: its pattern's names and its `let`s end with it.
@@ -2245,7 +2329,7 @@ impl<'r> Lowerer<'r> {
                         ElementType::Bool,
                         rel_code(&RelationalOp::Eq),
                     );
-                    self.lower_guarded_arm(cond.reg, arm, merge)?;
+                    self.lower_guarded_arm(cond.reg, arm, merge, result)?;
                 }
                 // A literal arm (`0 => ..`): the same chain, with the literal as the tag.
                 crate::syntax::Pattern::Literal(lit) => {
@@ -2262,12 +2346,10 @@ impl<'r> Lowerer<'r> {
                         ElementType::Bool,
                         rel_code(&RelationalOp::Eq),
                     );
-                    self.lower_guarded_arm(cond.reg, arm, merge)?;
+                    self.lower_guarded_arm(cond.reg, arm, merge, result)?;
                 }
                 crate::syntax::Pattern::Wildcard => {
-                    for s in &arm.body {
-                        self.lower_stmt(s)?;
-                    }
+                    self.lower_match_arm(&arm.body, result)?;
                     if !self.block_terminated() {
                         self.emit_effect(Opcode::Br, Register(0), Register(0), merge as u64);
                     }
@@ -2278,9 +2360,7 @@ impl<'r> Lowerer<'r> {
                 crate::syntax::Pattern::Identifier(name) => {
                     self.note_shadow(name);
                     self.scope.insert(name.clone(), Binding::Reg(subj.clone()));
-                    for s in &arm.body {
-                        self.lower_stmt(s)?;
-                    }
+                    self.lower_match_arm(&arm.body, result)?;
                     if !self.block_terminated() {
                         self.emit_effect(Opcode::Br, Register(0), Register(0), merge as u64);
                     }
@@ -2291,6 +2371,9 @@ impl<'r> Lowerer<'r> {
         self.close_blocks_to(depth);
         // No wildcard matched: the final else block falls through to the merge.
         if !self.block_terminated() {
+            if result.is_some() {
+                self.emit_missing_match_value_guard();
+            }
             self.emit_effect(Opcode::Br, Register(0), Register(0), merge as u64);
         }
         self.emit_effect(Opcode::BlockStart, Register(0), Register(0), merge as u64);
@@ -2334,7 +2417,12 @@ impl<'r> Lowerer<'r> {
     /// tag against the variant's ordinal and, in the taken block, bind each payload pattern to the
     /// loaded payload field before running the arm body — the same tag-dispatch + `extractvalue` the
     /// AST codegen emits, but through the flat aggregate machinery. (#242)
-    fn lower_data_match(&mut self, m: &crate::syntax::MatchExpr, enum_ty: &Type) -> Lowered<()> {
+    fn lower_data_match(
+        &mut self,
+        m: &crate::syntax::MatchExpr,
+        enum_ty: &Type,
+        result: Option<Register>,
+    ) -> Lowered<()> {
         let (nominal, args) = match enum_ty {
             Type::GenericInstance(base, args) => (base.as_ref(), args.as_slice()),
             other => (other, &[][..]),
@@ -2448,18 +2536,14 @@ impl<'r> Lowerer<'r> {
                             }
                         }
                     }
-                    for s in &arm.body {
-                        self.lower_stmt(s)?;
-                    }
+                    self.lower_match_arm(&arm.body, result)?;
                     if !self.block_terminated() {
                         self.emit_effect(Opcode::Br, Register(0), Register(0), merge as u64);
                     }
                     self.emit_effect(Opcode::BlockStart, Register(0), Register(0), next_b as u64);
                 }
                 crate::syntax::Pattern::Wildcard => {
-                    for s in &arm.body {
-                        self.lower_stmt(s)?;
-                    }
+                    self.lower_match_arm(&arm.body, result)?;
                     if !self.block_terminated() {
                         self.emit_effect(Opcode::Br, Register(0), Register(0), merge as u64);
                     }
@@ -2474,6 +2558,9 @@ impl<'r> Lowerer<'r> {
         }
         self.close_blocks_to(depth);
         if !self.block_terminated() {
+            if result.is_some() {
+                self.emit_missing_match_value_guard();
+            }
             self.emit_effect(Opcode::Br, Register(0), Register(0), merge as u64);
         }
         self.emit_effect(Opcode::BlockStart, Register(0), Register(0), merge as u64);
@@ -2533,7 +2620,17 @@ impl<'r> Lowerer<'r> {
             if i + 1 == n {
                 if let Statement::ExprStmt(es) = s {
                     if !es.has_semi {
-                        let v = self.lower_expr(&es.expr)?;
+                        let mut v = self.lower_expr(&es.expr)?;
+                        // Construction gives an address. Store the struct value, not its address.
+                        if construction_tail(&es.expr) && matches!(v.ty, LoweredTy::Aggregate(_)) {
+                            v = self.emit_typed(
+                                Opcode::SlotLoad,
+                                v.reg,
+                                Register(0),
+                                v.ty.clone(),
+                                0,
+                            );
+                        }
                         self.emit_effect(Opcode::Store, slot, v.reg, 0);
                         self.drop_temps_here(None);
                         return self.run_queued_drops();
@@ -2543,6 +2640,9 @@ impl<'r> Lowerer<'r> {
                     if self.is_never_call(&es.expr) {
                         return self.lower_stmt(s);
                     }
+                }
+                if matches!(s, Statement::Return(_)) {
+                    return self.lower_stmt(s);
                 }
                 return Err(Decline::Unsupported {
                     what: "a branch whose last statement is not a value",
@@ -3511,11 +3611,8 @@ impl<'r> Lowerer<'r> {
                 let (gid, _) = self.enum_instance_layout_of(base, args)?;
                 return Some(LoweredTy::Aggregate(gid));
             }
-            if matches!(ty, Type::GenericInstance(..))
-                && matches!(base, Type::Struct(..))
-                && self.registry.nominal_layout_id(base).is_none()
-            {
-                let gid = self.struct_instance_layout_of(base, args)?;
+            if matches!(base, Type::Struct(..)) && self.registry.nominal_layout_id(base).is_none() {
+                let gid = self.resolve_concrete_layout(ty)?;
                 return Some(LoweredTy::Aggregate(gid));
             }
         }
@@ -3559,12 +3656,90 @@ impl<'r> Lowerer<'r> {
         if let Some(gid) = agg_gid_of_ty(ty, self.registry) {
             return Some(gid);
         }
-        if let Type::GenericInstance(base, args) = deref_to_pointee(ty) {
-            if matches!(base.as_ref(), Type::Struct(..)) {
-                return self.struct_instance_layout_of(base.as_ref(), args);
-            }
+        self.resolve_concrete_layout(deref_to_pointee(ty))
+    }
+
+    /// Resolve storage from declarations without changing the frozen registry.
+    fn resolve_concrete_layout(&mut self, ty: &Type) -> Option<TypeId> {
+        let (base, mut args) = match ty {
+            Type::GenericInstance(base, args) => (base.as_ref(), args.clone()),
+            other => (other, Vec::new()),
+        };
+        let (name, declaration) = self
+            .registry
+            .aggregate_identities()
+            .resolve_base(base.into())?;
+        for arg in &mut args {
+            self.registry.aggregate_identities().normalize_type(arg)?;
         }
-        None
+        let is_enum = self.registry.enum_data.contains_key(&name);
+        let gid = if is_enum {
+            if self.registry.enum_data.get(&name)?.generics.len() != args.len() {
+                return None;
+            }
+            enum_instance_gid(declaration, &args, self.registry.aggregate_identities())?
+        } else {
+            let decl = self.registry.structs.get(&declaration)?;
+            if decl.generics.len() != args.len() {
+                return None;
+            }
+            if args.is_empty() {
+                declaration
+            } else {
+                struct_instance_gid(declaration, &args, self.registry.aggregate_identities())?
+            }
+        };
+        let identity = ConcreteLayoutIdentity {
+            declaration,
+            arguments: args.clone(),
+        };
+        if let Some(existing) = self.completed_layout_identities.get(&gid) {
+            assert!(
+                existing.semantically_eq(&identity, self.registry.aggregate_identities()),
+                "a cached layout ID must keep the same declaration and type arguments for {gid:?}: cached {existing:#?}, requested {identity:#?}"
+            );
+        }
+        let mut cycle = false;
+        for (active_id, active) in &self.resolving_layouts {
+            if *active_id == gid {
+                assert!(
+                    active.semantically_eq(&identity, self.registry.aggregate_identities()),
+                    "a layout ID being resolved must keep the same declaration and type arguments for {gid:?}: current {active:#?}, requested {identity:#?}"
+                );
+            }
+            // The same declaration and type arguments form a value cycle, even with different IDs.
+            cycle |= active.semantically_eq(&identity, self.registry.aggregate_identities());
+        }
+        if cycle {
+            return None;
+        }
+        if self.instance_layouts.contains_key(&gid) || self.generated_layout(gid).is_some() {
+            assert!(
+                self.completed_layout_identities.contains_key(&gid),
+                "a cached layout must keep its declaration and type arguments"
+            );
+            return Some(gid);
+        }
+        if !is_enum && args.is_empty() && self.registry.nominal_layout_id(base).is_some() {
+            self.completed_layout_identities.insert(gid, identity);
+            return Some(gid);
+        }
+        if self.resolving_layouts.len() >= MAX_LAYOUT_RESOLUTION_DEPTH {
+            return None;
+        }
+        self.resolving_layouts.push((gid, identity.clone()));
+        let result = if is_enum {
+            self.build_enum_instance_layout(declaration, &args)
+                .map(|(id, _)| id)
+        } else {
+            self.build_struct_instance_layout(declaration, &args, gid)
+        };
+        self.resolving_layouts.pop();
+        if let Some(id) = result {
+            assert_eq!(id, gid, "building a layout must keep the requested ID");
+            self.completed_layout_identities.insert(gid, identity);
+        }
+        result
     }
 
     fn generated_layout(&self, gid: TypeId) -> Option<&crate::layout::GeneratedAggregateLayout> {
@@ -3574,13 +3749,16 @@ impl<'r> Lowerer<'r> {
     }
 
     fn record_generated_layout(&mut self, layout: crate::layout::GeneratedAggregateLayout) {
+        if let Some(existing) = self.generated_layout(layout.type_id) {
+            assert!(
+                existing.semantically_eq(&layout, self.registry.aggregate_identities()),
+                "a layout ID must keep the same fields, size, and alignment: existing {existing:#?}, requested {layout:#?}"
+            );
+            return;
+        }
         self.agg_layout_indices
-            .entry(layout.type_id)
-            .or_insert_with(|| {
-                let index = self.agg_layouts.len();
-                self.agg_layouts.push(layout);
-                index
-            });
+            .insert(layout.type_id, self.agg_layouts.len());
+        self.agg_layouts.push(layout);
     }
 
     /// A layout by GID: a synthesized struct instance's, else the frozen registry's.
@@ -3644,11 +3822,31 @@ impl<'r> Lowerer<'r> {
         base: impl Into<crate::layout::identity::AggregateBase<'a>>,
         args: &[Type],
     ) -> Option<TypeId> {
-        let (base, declaration) = self
+        let (name, declaration) = self
             .registry
             .aggregate_identities()
             .resolve_base(base.into())?;
-        let gid = struct_instance_gid(declaration, args, self.registry.aggregate_identities())?;
+        self.registry.structs.get(&declaration)?;
+        let base = Type::Struct(name, Some(declaration));
+        let ty = if args.is_empty() {
+            base
+        } else {
+            Type::GenericInstance(Box::new(base), args.to_vec())
+        };
+        self.resolve_concrete_layout(&ty)
+    }
+
+    fn build_struct_instance_layout(
+        &mut self,
+        declaration: TypeId,
+        args: &[Type],
+        gid: TypeId,
+    ) -> Option<TypeId> {
+        let base = self
+            .registry
+            .aggregate_identities()
+            .resolve_base(declaration.into())?
+            .0;
         if self.instance_layouts.contains_key(&gid) {
             return Some(gid);
         }
@@ -3729,11 +3927,33 @@ impl<'r> Lowerer<'r> {
                             FieldTy::Nominal(inner),
                         )
                     }
-                    // A plain struct held by value, `Holder<Noisy> { value : Noisy }`.
-                    Type::Struct(..) if self.nominal_struct_gid(&fty).is_some() => {
-                        let gid = self.nominal_struct_gid(&fty)?;
-                        let (sz, al, mlir) = self.payload_field(&fty)?;
-                        (sz, al, mlir, FieldTy::Nominal(gid))
+                    Type::Struct(..) | Type::Enum(..)
+                        if matches!(
+                            lowered_ty(&fty, self.registry),
+                            Some(LoweredTy::Scalar(ElementType::I32))
+                        ) =>
+                    {
+                        (4, 4, "i32".to_string(), FieldTy::Scalar(ElementType::I32))
+                    }
+                    Type::Struct(..) => {
+                        let inner = self.resolve_concrete_layout(&fty)?;
+                        let def = self.layout_of(&inner)?;
+                        let mlir = if let Some(layout) = self.generated_layout(inner) {
+                            crate::codegen::flat::generated_storage_type(layout)
+                        } else {
+                            crate::codegen::flat::agg_struct_ty_of(
+                                inner,
+                                self.registry,
+                                &mut Vec::new(),
+                            )
+                            .ok()?
+                        };
+                        (
+                            def.size_bytes as u64,
+                            def.align_bytes as u64,
+                            mlir,
+                            FieldTy::Nominal(inner),
+                        )
                     }
                     _ => {
                         let (sz, al, kind) = crate::layout::structural_field_info(&fty)?;
@@ -3746,14 +3966,14 @@ impl<'r> Lowerer<'r> {
                         (sz as u64, al as u64, mlir, kind)
                     }
                 };
-                off = crate::layout::align_up(off as usize, al as usize) as u64;
+                off = crate::layout::checked_align_up(off, al)?;
                 let field = crate::layout::FieldLayout {
                     name: name.clone(),
-                    offset: off as usize,
-                    size: sz as usize,
+                    offset: usize::try_from(off).ok()?,
+                    size: usize::try_from(sz).ok()?,
                     ty: kind,
                 };
-                off += sz;
+                off = off.checked_add(sz)?;
                 align = align.max(al);
                 (field, mlir)
             };
@@ -3774,7 +3994,7 @@ impl<'r> Lowerer<'r> {
             align = def.align_bytes as u64;
             def.size_bytes
         } else {
-            crate::layout::align_up(off as usize, align as usize)
+            usize::try_from(crate::layout::checked_align_up(off, align)?).ok()?
         };
         if !self.agg_layout_indices.contains_key(&gid) {
             let layout = crate::layout::GeneratedAggregateLayout {
@@ -3792,20 +4012,12 @@ impl<'r> Lowerer<'r> {
         Some(gid)
     }
 
-    /// Whether `ty` borrows or points to a generic struct instance whose layout is synthesized
-    /// (`&Peek<i64>`), which the registry alone does not know.
+    /// Whether a pointer parameter targets an aggregate completed by this worker.
     fn borrows_a_struct_instance(&mut self, ty: &Type) -> bool {
         let (Type::Borrow { inner, .. } | Type::Pointer(inner, ..)) = ty else {
             return false;
         };
-        let Type::GenericInstance(b, a) = inner.as_ref() else {
-            return false;
-        };
-        let Type::Struct(..) = b.as_ref() else {
-            return false;
-        };
-        agg_gid_of_ty(ty, self.registry).is_none()
-            && self.struct_instance_layout_of(b.as_ref(), a).is_some()
+        agg_gid_of_ty(ty, self.registry).is_none() && self.resolve_concrete_layout(inner).is_some()
     }
 
     /// A complete declared struct layout, resolved by declaration identity.
@@ -3861,10 +4073,30 @@ impl<'r> Lowerer<'r> {
         base: impl Into<crate::layout::identity::AggregateBase<'a>>,
         args: &[Type],
     ) -> Option<(TypeId, Vec<u64>)> {
-        let (base, declaration) = self
+        let (name, declaration) = self
             .registry
             .aggregate_identities()
             .resolve_base(base.into())?;
+        let base = Type::Enum(name, Some(declaration));
+        let ty = if args.is_empty() {
+            base
+        } else {
+            Type::GenericInstance(Box::new(base), args.to_vec())
+        };
+        let gid = self.resolve_concrete_layout(&ty)?;
+        Some((gid, self.generated_layout(gid)?.field_offsets()))
+    }
+
+    fn build_enum_instance_layout(
+        &mut self,
+        declaration: TypeId,
+        args: &[Type],
+    ) -> Option<(TypeId, Vec<u64>)> {
+        let base = self
+            .registry
+            .aggregate_identities()
+            .resolve_base(declaration.into())?
+            .0;
         let gid = enum_instance_gid(declaration, args, self.registry.aggregate_identities())?;
         if let Some(layout) = self.generated_layout(gid) {
             return Some((gid, layout.field_offsets()));
@@ -3925,14 +4157,16 @@ impl<'r> Lowerer<'r> {
                         .collect::<Option<Vec<_>>>()
                 })
                 .collect::<Option<Vec<_>>>()?;
-            self.record_generated_layout(crate::layout::GeneratedAggregateLayout {
+            let layout = crate::layout::GeneratedAggregateLayout {
                 type_id: gid,
                 name: base.to_string(),
                 size_bytes: storage.size,
                 align_bytes: storage.align,
                 fields,
                 variant_payloads,
-            });
+            };
+            self.instance_layouts.insert(gid, layout.type_definition());
+            self.record_generated_layout(layout);
         }
         let layout = self.generated_layout(gid)?;
         Some((gid, layout.field_offsets()))
@@ -3959,6 +4193,16 @@ impl<'r> Lowerer<'r> {
                     )?
                 }
             },
+        };
+        // Zero alignment marks an incomplete layout that this worker must resolve before construction.
+        let gid = if self.layout_of(&gid).is_some_and(|def| def.align_bytes == 0) {
+            let ty = Type::Struct(si.name.clone(), Some(gid));
+            self.resolve_concrete_layout(&ty)
+                .ok_or(Decline::TypeNotModelled {
+                    what: "a struct layout that is not modelled yet",
+                })?
+        } else {
+            gid
         };
         let def = self.layout_of(&gid).ok_or(Decline::TypeNotModelled {
             what: "a struct with no modelled layout",
@@ -5582,19 +5826,9 @@ impl<'r> Lowerer<'r> {
                 // `Option::unwrap`): lower the match as a statement — each arm emits its own `Ret` — then
                 // give the fall-through merge block a terminator: a default (zero) return of the
                 // function's type, or for a struct or enum, an abort. (#242)
-                if let Some(Expr::Match(m)) = &r.expr {
-                    // The zero below is a fall-through default, correct when nothing reaches the
-                    // merge block carrying a value -- `Option::unwrap`'s `None` arm ends in an
-                    // `assert`, falls through, and has no value to contribute. It is wrong when an
-                    // arm ends in a bare expression: `match x { 0 => { 7 }, _ => { 9 } }` computed
-                    // both arms and then returned the default, silently. There is no value form
-                    // here (`lower_match` yields nothing), so decline to the oracle, which lowers
-                    // it with a merge-block argument and gets it right.
-                    if crate::syntax::expr::match_yields_a_value(m) {
-                        return Err(Decline::TypeNotModelled {
-                            what: "a match in value position",
-                        });
-                    }
+                if let Some(Expr::Match(m)) = r.expr.as_ref().filter(|expr| {
+                    matches!(expr, Expr::Match(m) if !crate::syntax::expr::match_yields_a_value(m))
+                }) {
                     if !self.value_drops.is_empty() {
                         return Err(Decline::Unsupported {
                             what: "a drop waiting for the value of a returned match",
@@ -5931,7 +6165,7 @@ fn try_lower<'r>(func: &Function, registry: &'r ImmutableGlobalRegistry) -> Lowe
     let has_aggregate_param = func
         .params
         .iter()
-        .any(|(_, ty)| matches!(lowered_ty(ty, registry), Some(LoweredTy::Aggregate(_))));
+        .any(|(_, ty)| matches!(lw.lower_ty_synth(ty), Some(LoweredTy::Aggregate(_))));
     lw.memory = lw.has_control_flow || has_aggregate_param || body_constructs_struct(&func.body);
     lw.ret_ty = lw.lower_ty_synth(&func.return_type);
     lw.ret_void = crate::syntax::is_void_ty(&func.return_type);

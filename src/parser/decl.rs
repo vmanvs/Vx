@@ -35,9 +35,19 @@ impl<'a> Parser<'a> {
         if !self.check(&TokenType::RightParen) {
             loop {
                 let is_mut = self.match_token(&TokenType::Mut);
+                // Keep the name token so a missing type on `self` can point at the name.
+                let name_token = self.peek().clone();
                 let name = self.expect_identifier("Expected parameter name")?;
                 if is_mut {
                     self.mut_params.push(name.clone().into());
+                }
+                // Rust lets a method take a bare `self`. Vx needs an explicit type. Say so
+                // instead of "Expected ':'". Suggest `Self`, which works in an impl and in a trait.
+                if name == "self" && !self.check(&TokenType::Colon) {
+                    return Err(self.error_at(
+                        &name_token,
+                        "`self` needs a type. Write `self : &Self`, `self : &mut Self` or `self : Self`.",
+                    ));
                 }
                 self.consume(&TokenType::Colon, "Expected ':'")?;
                 let ty = self.parse_type()?;
@@ -151,6 +161,13 @@ impl<'a> Parser<'a> {
         let is_unsafe = self.match_token(&TokenType::Unsafe);
         self.consume(&TokenType::Fn, "Expected 'fn'")?;
 
+        let name_token = self.peek();
+        let span = crate::syntax::Span {
+            line: name_token.line,
+            column: name_token.column,
+            length: name_token.length,
+            expansion: self.expansion(),
+        };
         let name = self.expect_identifier("Expected function name")?;
 
         let generics = self.parse_generic_params()?;
@@ -270,6 +287,8 @@ impl<'a> Parser<'a> {
             where_transfers,
             body,
             doc_comment: None,
+            span,
+            file: None,
         })
     }
 
@@ -1158,6 +1177,25 @@ impl<'a> Parser<'a> {
             let is_safe = self.match_token(&TokenType::Safe);
             self.consume(&TokenType::Fn, "Expected 'fn'")?;
             let name = self.expect_identifier("Expected function name")?;
+            // `<M : Memory>`: one C function for a pointer into any memory, since the memory
+            // never reaches C. Only memory parameters, because a C function has one machine type.
+            let generics = self.parse_generic_params()?;
+            let mut memories = Vec::new();
+            for g in &generics {
+                match g {
+                    GenericParam::Type { name, bounds }
+                        if bounds.len() == 1 && bounds[0].trait_name.as_ref() == "Memory" =>
+                    {
+                        memories.push(name.clone())
+                    }
+                    _ => {
+                        return Err(self.error(
+                            "An extern function can only take memory parameters, as in \
+                             `<M : Memory>`",
+                        ))
+                    }
+                }
+            }
 
             self.consume(&TokenType::LeftParen, "Expected '('")?;
             let params = self.parse_comma_separated_params()?;
@@ -1166,10 +1204,14 @@ impl<'a> Parser<'a> {
             self.consume(&TokenType::Arrow, "Expected '->'")?;
             let return_type = self.parse_return_type()?;
             self.consume(&TokenType::Semicolon, "Expected ';'")?;
+            for _ in 0..generics.len() {
+                self.generic_params.pop();
+            }
 
             externs.push(ExternDecl {
                 name: name.into(),
                 is_safe,
+                memories,
                 params,
                 return_type,
                 span: Span {
@@ -1722,6 +1764,7 @@ impl<'a> Parser<'a> {
         }
         Ok(Program {
             module_path: self.source.to_string().into(), // Default fallback, should be overridden by pipeline
+            file: None,
             item_macros,
             imports,
             macros,
@@ -2139,7 +2182,7 @@ fn distributed_matmul(a: Ref<Tensor<f32, [?, ?]>, Memory::CPU_DRAM>, b: Ref<Tens
             let err = parser
                 .parse_function()
                 .expect_err("transfer as a binding name should fail");
-            let msg = err.format(input);
+            let msg = err.format(input, None);
             assert!(
                 msg.contains("`transfer` is a keyword and cannot be used as a name"),
                 "message was: {msg}"
@@ -2153,7 +2196,7 @@ fn distributed_matmul(a: Ref<Tensor<f32, [?, ?]>, Memory::CPU_DRAM>, b: Ref<Tens
         let let_input = cases[0];
         let tokens = crate::lexer::Lexer::new(let_input).tokenize();
         let mut parser = Parser::new(&tokens, let_input);
-        let msg = parser.parse_function().unwrap_err().format(let_input);
+        let msg = parser.parse_function().unwrap_err().format(let_input, None);
         assert!(
             msg.contains("Error at 1:24:"),
             "expected span on transfer, got: {msg}"
@@ -2170,7 +2213,7 @@ fn distributed_matmul(a: Ref<Tensor<f32, [?, ?]>, Memory::CPU_DRAM>, b: Ref<Tens
         let msg = parser
             .parse_function()
             .expect_err("for across should fail")
-            .format(for_input);
+            .format(for_input, None);
         assert!(
             msg.contains("`across` is a keyword and cannot be used as a name"),
             "message was: {msg}"
@@ -2182,7 +2225,7 @@ fn distributed_matmul(a: Ref<Tensor<f32, [?, ?]>, Memory::CPU_DRAM>, b: Ref<Tens
         let msg = parser
             .parse_function()
             .expect_err("fn across should fail")
-            .format(fn_input);
+            .format(fn_input, None);
         assert!(
             msg.contains("`across` is a keyword and cannot be used as a name"),
             "message was: {msg}"
@@ -2190,6 +2233,51 @@ fn distributed_matmul(a: Ref<Tensor<f32, [?, ?]>, Memory::CPU_DRAM>, b: Ref<Tens
         assert!(
             msg.contains("Error at 1:4:"),
             "expected span on across, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_self_parameter_needs_a_type() {
+        // A bare `self` in an impl method is a Rust habit. Suggest `Self`.
+        let input = "impl P { fn get(self) -> i64 { return self.a; } }";
+        let tokens = crate::lexer::Lexer::new(input).tokenize();
+        let mut parser = Parser::new(&tokens, input);
+        let msg = parser
+            .parse_impl_block()
+            .expect_err("bare self should fail")
+            .format(input, None);
+        assert!(
+            msg.contains(
+                "`self` needs a type. Write `self : &Self`, `self : &mut Self` or `self : Self`."
+            ),
+            "message was: {msg}"
+        );
+        assert!(
+            !msg.contains("Expected ':'"),
+            "must not fall through to the generic colon error: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_self_parameter_needs_a_type_in_a_trait() {
+        // A trait method uses the same param parser and has no impl_self. The message
+        // must still name `Self`, not a placeholder like `T`.
+        let input = "trait Get { fn get(self) -> i64; }";
+        let tokens = crate::lexer::Lexer::new(input).tokenize();
+        let mut parser = Parser::new(&tokens, input);
+        let msg = parser
+            .parse_trait_decl()
+            .expect_err("bare self in a trait should fail")
+            .format(input, None);
+        assert!(
+            msg.contains(
+                "`self` needs a type. Write `self : &Self`, `self : &mut Self` or `self : Self`."
+            ),
+            "message was: {msg}"
+        );
+        assert!(
+            !msg.contains("`self : &T`") && !msg.contains("`self : T`"),
+            "must not suggest a placeholder T: {msg}"
         );
     }
 

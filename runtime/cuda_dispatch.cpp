@@ -53,6 +53,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "vx_arrival_counts.h"
+#include "vx_collective.h"
 #include "vx_device_pool.h"
 #include "vx_dispatch_plan.h"
 #include "vx_host_call.h"
@@ -60,6 +61,7 @@
 #include "vx_remote_routing.h"
 #include "vx_stream_policy.h"
 
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -385,18 +387,22 @@ const DriverApi &driver() {
 }
 
 /// Declared ids the program said are local devices (VX_CTRL_LOCAL_DEVICE),
-/// each with the built-in id it stands for. Filled before `main`, read after.
+/// each with the built-in id it stands for. A program fills it at the start of
+/// `main`, and a library at the start of each `pub fn`, so two threads can add
+/// at the same time. A thread writes an entry before the count that shows it.
 struct LocalDevice {
   int32_t declared;
   int32_t builtin;
 };
 LocalDevice local_devices[64];
-size_t local_device_count = 0;
+std::atomic<size_t> local_device_count{0};
+std::mutex local_devices_mutex;
 
 /// The GPU ordinal a topology id names, or -1 when it names no GPU. A declared
 /// id is looked up in `local_devices` first.
 int gpu_index(int32_t topology_id) {
-  for (size_t i = 0; i < local_device_count; ++i) {
+  const size_t count = local_device_count.load(std::memory_order_acquire);
+  for (size_t i = 0; i < count; ++i) {
     if (local_devices[i].declared == topology_id) {
       topology_id = local_devices[i].builtin;
       break;
@@ -1565,6 +1571,94 @@ void vx_cuda_set_stream(void *stream) {
 /// The stream that `vx_cuda_set_stream` set on the calling thread, or null.
 void *vx_cuda_get_stream(void) { return caller_stream; }
 
+/// This process's rank in a job of several GPUs. See docs/lang/abi.md
+/// section 3.7.
+static vx::NcclCollective &collective() {
+  static vx::NcclCollective c(vx::CollectiveDevice{
+      [] { return static_cast<void *>(caller_stream); },
+      [] { return recording(); },
+      [](const void *ptr) { return is_device_ptr(ptr); },
+      [] {
+        int device = 0;
+        VX_CUDA_CHECK(cudaGetDevice(&device));
+        return device;
+      },
+      [](int device) { VX_CUDA_CHECK(cudaSetDevice(device)); },
+  });
+  return c;
+}
+
+/// With no GPU, a program runs on the CPU, and a job has one rank.
+static vx::OneRankCollective one_rank;
+
+static void collective_check(const std::string &why) {
+  if (!why.empty()) {
+    fprintf(stderr, "[Vx CUDA] FATAL: %s\n", why.c_str());
+    abort();
+  }
+}
+
+void vx_collective_init(int32_t rank, int32_t ranks) {
+  if (!cuda_available()) {
+    collective_check(one_rank.init(rank, ranks));
+    return;
+  }
+  const char *lib = getenv("VX_NCCL_LIB");
+  const char *id_file = getenv("VX_NCCL_ID_FILE");
+  collective_check(collective().init(rank, ranks,
+                                     lib && *lib ? lib : "libnccl.so.2",
+                                     id_file, std::chrono::seconds(300)));
+}
+
+void vx_collective_finish(void) {
+  collective_check(cuda_available() ? collective().finish()
+                                    : one_rank.finish());
+}
+
+int32_t vx_collective_rank(void) {
+  return cuda_available() ? collective().rank() : one_rank.rank();
+}
+
+int32_t vx_collective_ranks(void) {
+  return cuda_available() ? collective().ranks() : one_rank.ranks();
+}
+
+void vx_collective_all_reduce_sum_f32(const float *input, float *output,
+                                      int64_t count) {
+  const char *name = "vx_collective_all_reduce_sum_f32";
+  collective_check(cuda_available()
+                       ? collective().all_reduce_sum(input, output, count,
+                                                     vx::NcclFloat32, name)
+                       : one_rank.copy(input, output, count, 4, name));
+}
+
+void vx_collective_all_reduce_sum_bf16(const uint16_t *input, uint16_t *output,
+                                       int64_t count) {
+  const char *name = "vx_collective_all_reduce_sum_bf16";
+  collective_check(cuda_available()
+                       ? collective().all_reduce_sum(input, output, count,
+                                                     vx::NcclBfloat16, name)
+                       : one_rank.copy(input, output, count, 2, name));
+}
+
+void vx_collective_all_gather_f32(const float *input, float *output,
+                                  int64_t count) {
+  const char *name = "vx_collective_all_gather_f32";
+  collective_check(
+      cuda_available()
+          ? collective().all_gather(input, output, count, vx::NcclFloat32, name)
+          : one_rank.copy(input, output, count, 4, name));
+}
+
+void vx_collective_all_gather_bf16(const uint16_t *input, uint16_t *output,
+                                   int64_t count) {
+  const char *name = "vx_collective_all_gather_bf16";
+  collective_check(cuda_available()
+                       ? collective().all_gather(input, output, count,
+                                                 vx::NcclBfloat16, name)
+                       : one_rank.copy(input, output, count, 2, name));
+}
+
 static vx::ArrivalCounts &arrival_counts() {
   static vx::ArrivalCounts counts;
   return counts;
@@ -1612,13 +1706,29 @@ int32_t vx_plugin_control(uint32_t opcode, void *payload) {
     if (!pair) {
       return 0;
     }
-    if (local_device_count ==
-        sizeof(local_devices) / sizeof(local_devices[0])) {
+    // Each call of a `pub fn` tells the same pairs again.
+    std::lock_guard<std::mutex> lock(local_devices_mutex);
+    const size_t count = local_device_count.load(std::memory_order_relaxed);
+    for (size_t i = 0; i < count; ++i) {
+      if (local_devices[i].declared != pair[0]) {
+        continue;
+      }
+      if (local_devices[i].builtin != pair[1]) {
+        fprintf(stderr,
+                "[Vx CUDA] FATAL: the topology %d is declared as two local "
+                "devices, %d and %d\n",
+                pair[0], local_devices[i].builtin, pair[1]);
+        abort();
+      }
+      return 1;
+    }
+    if (count == sizeof(local_devices) / sizeof(local_devices[0])) {
       fprintf(stderr, "[Vx CUDA] FATAL: more than %zu declared local devices\n",
-              local_device_count);
+              count);
       abort();
     }
-    local_devices[local_device_count++] = {pair[0], pair[1]};
+    local_devices[count] = {pair[0], pair[1]};
+    local_device_count.store(count + 1, std::memory_order_release);
     return 1;
   }
   default:

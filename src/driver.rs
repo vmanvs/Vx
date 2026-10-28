@@ -51,8 +51,12 @@ pub enum Action {
     EmitPtx,
 }
 
+/// What `vxc --version` prints after the name: the package version, then the commit the
+/// compiler was built from when the build set `VX_VERSION_WITH_COMMIT=1`, as `0.0.3 (f1fb0333)`.
+pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), vx_build_commit::commit_suffix!());
+
 #[derive(Parser, Debug, Clone)]
-#[command(author, version, about, long_about = None)]
+#[command(author, version = VERSION, about, long_about = None)]
 pub struct DriverOptions {
     /// Action to perform
     #[arg(short = 'a', long = "action", value_enum, default_value_t = Action::RunJit)]
@@ -116,6 +120,11 @@ pub struct DriverOptions {
     /// imports that start with `name`. Can be given more than once.
     #[arg(long = "package", value_name = "NAME=DIR", value_parser = parse_package)]
     pub packages: Vec<(String, PathBuf)>,
+
+    /// Read the standard library from DIR instead of from beside the compiler. Can be given more
+    /// than once; the directories are searched in order.
+    #[arg(long = "std-path", value_name = "DIR")]
+    pub std_paths: Vec<PathBuf>,
 
     /// The host the program runs on: a file declaring `Memory::CPU_DRAM`, or
     /// `default` for the machine compiling it.
@@ -210,8 +219,14 @@ pub struct DriverOptions {
 
     /// `-fauto-schedule-levels`: an `across` loop on an arch that cannot launch its levels runs
     /// as a plain `for` that carries its level as metadata for MLIR and LLVM. The default,
-    /// `-fno-auto-schedule-levels`, makes such a loop an error. The last one wins
-    #[arg(short = 'f', value_name = "FEATURE", value_parser = ["auto-schedule-levels", "no-auto-schedule-levels"])]
+    /// `-fno-auto-schedule-levels`, makes such a loop an error.
+    ///
+    /// `-fweak-relaxed-atomics`: a relaxed atomic read stays relaxed, so a program may see load
+    /// buffering, which the memory model otherwise forbids. The default,
+    /// `-fno-weak-relaxed-atomics`, makes each relaxed read an acquire read.
+    ///
+    /// For each feature, the last one wins
+    #[arg(short = 'f', value_name = "FEATURE", value_parser = ["auto-schedule-levels", "no-auto-schedule-levels", "weak-relaxed-atomics", "no-weak-relaxed-atomics"])]
     pub features: Vec<String>,
 
     /// Optimization level (-O0 to -O3)
@@ -236,11 +251,23 @@ pub struct DriverOptions {
 }
 
 impl DriverOptions {
-    /// Whether `-fauto-schedule-levels` is on: the last of it and `-fno-auto-schedule-levels`.
-    pub fn auto_schedule_levels(&self) -> bool {
+    /// Whether `-f<name>` is on: the last of it and `-fno-<name>`.
+    fn feature(&self, name: &str) -> bool {
         self.features
-            .last()
-            .is_some_and(|f| f == "auto-schedule-levels")
+            .iter()
+            .rev()
+            .find(|f| f.strip_prefix("no-").unwrap_or(f) == name)
+            .is_some_and(|f| f == name)
+    }
+
+    /// Whether `-fauto-schedule-levels` is on.
+    pub fn auto_schedule_levels(&self) -> bool {
+        self.feature("auto-schedule-levels")
+    }
+
+    /// Whether `-fweak-relaxed-atomics` is on.
+    pub fn weak_relaxed_atomics(&self) -> bool {
+        self.feature("weak-relaxed-atomics")
     }
 }
 
@@ -692,9 +719,13 @@ impl CompilerDriver {
         )
     }
 
-    /// A loader that reads the `--package` directories.
+    /// A loader that reads the `--std-path` and `--package` directories.
     fn module_loader(&self) -> ModuleLoader {
-        let mut loader = ModuleLoader::new();
+        let mut loader = if self.options.std_paths.is_empty() {
+            ModuleLoader::new()
+        } else {
+            ModuleLoader::with_std_paths(self.options.std_paths.clone())
+        };
         for (name, dir) in &self.options.packages {
             loader.add_package(name, dir);
         }
@@ -784,6 +815,7 @@ impl CompilerDriver {
     fn native_host_program() -> crate::syntax::Program {
         crate::syntax::Program {
             module_path: crate::symbol::Symbol::from(NATIVE_HOST_MODULE),
+            file: None,
             item_macros: Vec::new(),
             memories: vec![crate::syntax::MemoryDecl {
                 name: crate::symbol::Symbol::from("CPU_DRAM"),
@@ -1007,6 +1039,7 @@ impl CompilerDriver {
         Some(crate::syntax::Program {
             item_macros: Vec::new(),
             module_path: "<interfaces>".into(),
+            file: None,
             imports: Vec::new(),
             macros: Vec::new(),
             externs: Vec::new(),
@@ -1035,6 +1068,15 @@ impl CompilerDriver {
         let global_session =
             Self::session_with_interfaces(interfaces, self.options.auto_schedule_levels())?;
 
+        // Every function names its file, so a diagnostic found while checking it names the
+        // file too, wherever the check runs from. Before the env takes its clones, since a
+        // generic instance is built from the env's copy of the function. After macro
+        // expansion, which adds functions.
+        ast.name_file_on_functions();
+        for p in other_asts.values_mut() {
+            p.name_file_on_functions();
+        }
+
         // Build the resolution env from *owned* clones: full bodies for the imported modules (so
         // their methods/generics can be instantiated) plus the entry module's signature. Owning the
         // clones leaves `ast` and `other_asts` free to be type-checked *in place* below — which #203
@@ -1059,8 +1101,17 @@ impl CompilerDriver {
         let mut checker = TypeChecker::new(&env, &mut worker);
         checker.seam.verify = self.options.verify_seams;
 
+        // The checks that look at the whole program's declarations at once can only name a
+        // file when the program is one file; a `--host default` module was read from none.
+        let whole_program_file = if other_asts.values().all(|p| p.file.is_none()) {
+            ast.file.clone()
+        } else {
+            None
+        };
+
         // Everything that is about the program as a whole rather than one function, before any
         // body is checked. Shared with the parallel pipeline so the two frontends cannot drift.
+        checker.errors.file = whole_program_file;
         checker.check_whole_program_declarations();
         // Found before the checks rename calls to generic instances, reported after them.
         let mut unused_functions = crate::diagnostic::DiagnosticsVec::new();
@@ -1546,6 +1597,13 @@ impl CompilerDriver {
                 .as_operation_mut()
                 .set_attribute("vx.export_kernels", melior::ir::Attribute::unit(context));
         }
+        if self.options.weak_relaxed_atomics() {
+            use melior::ir::operation::OperationMutLike;
+            module.as_operation_mut().set_attribute(
+                "vx.weak_relaxed_atomics",
+                melior::ir::Attribute::unit(context),
+            );
+        }
         let ran = crate::intern_mode::timed("mlir_passes", || pass_manager.run(&mut module));
         if let Err(e) = ran {
             return Err(format!("MLIR passes failed for {}: {}", filename, e));
@@ -1886,6 +1944,8 @@ impl CompilerDriver {
                 where_transfers: vec![],
                 body: vec![],
                 doc_comment: None,
+                span: crate::syntax::Span::default(),
+                file: None,
             };
             imported_entries.push((synth, body.hir.clone(), body.types.clone()));
         }
@@ -2079,6 +2139,8 @@ fn get_optimization_pipeline(
         // A function the program defines is not exported, so a `fn write` cannot replace
         // libc's `write` for the runtime library. See the pass.
         passes.push("vx-hide-program-symbols".to_string());
+        // Each relaxed atomic read becomes an acquire read, unless `-fweak-relaxed-atomics`.
+        passes.push("vx-order-relaxed-reads".to_string());
     }
 
     format!("builtin.module({})", passes.join(","))
@@ -2293,6 +2355,28 @@ mod flat_codegen_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Each `-f` feature takes the last of its own two spellings. Giving another feature after
+    /// it does not turn it off.
+    #[test]
+    fn each_feature_takes_the_last_of_its_own_flags() {
+        let parse = |args: &[&str]| {
+            let mut all = vec!["vxc", "a.vx"];
+            all.extend_from_slice(args);
+            DriverOptions::try_parse_from(all).expect("the flags parse")
+        };
+        let o = parse(&["-fweak-relaxed-atomics", "-fauto-schedule-levels"]);
+        assert!(o.weak_relaxed_atomics() && o.auto_schedule_levels());
+        let o = parse(&["-fweak-relaxed-atomics", "-fno-weak-relaxed-atomics"]);
+        assert!(!o.weak_relaxed_atomics());
+        let o = parse(&[
+            "-fno-auto-schedule-levels",
+            "-fauto-schedule-levels",
+            "-fno-weak-relaxed-atomics",
+        ]);
+        assert!(o.auto_schedule_levels() && !o.weak_relaxed_atomics());
+        assert!(!parse(&[]).weak_relaxed_atomics());
+    }
 
     /// Two modules can declare a host topology at once -- `--machine fleet/h100.vx --host default`
     /// gives exactly that -- so which one answers must not depend on the order the caller happened

@@ -366,18 +366,30 @@ impl<'a> TypeChecker<'a> {
                 self.check_task_exit(&Statement::Continue(c.clone()));
                 self.drops_exit("continue", c.span.line, true)
             }
-            Statement::Assign(AssignStmt { lhs, rhs, span: _ }) => {
-                self.check_assign_stmt(lhs, None, rhs, consume, None)
+            Statement::Assign(AssignStmt { lhs, rhs, span }) => {
+                let span = *span;
+                if let Some(call) = self.container_store(lhs, None, rhs, span) {
+                    *stmt = Statement::ExprStmt(ExprStmtStmt::new(call, true, span));
+                    self.check_statement(stmt, return_type, consume);
+                } else {
+                    self.check_assign_stmt(lhs, None, rhs, consume, None)
+                }
             }
             Statement::CompoundAssign(CompoundAssignStmt {
                 lhs,
                 op,
                 rhs,
-                span: _,
+                span,
                 operand_ty,
             }) => {
                 let op = op.clone();
-                self.check_assign_stmt(lhs, Some(&op), rhs, consume, Some(operand_ty))
+                let span = *span;
+                if let Some(call) = self.container_store(lhs, Some(&op), rhs, span) {
+                    *stmt = Statement::ExprStmt(ExprStmtStmt::new(call, true, span));
+                    self.check_statement(stmt, return_type, consume);
+                } else {
+                    self.check_assign_stmt(lhs, Some(&op), rhs, consume, Some(operand_ty))
+                }
             }
             Statement::Return(ret) => {
                 self.check_task_exit(&Statement::Return(ret.clone()));
@@ -439,6 +451,9 @@ impl<'a> TypeChecker<'a> {
         }
 
         self.current_assignment_target = Some(name.to_string());
+        // The variable is declared into the innermost scope, so it holds its borrows there.
+        self.pending_lets
+            .push((name.to_string(), self.scopes.len()));
         // Forward the annotation as an expected-type hint so a generic call can
         // deduce a return-only topology/type variable from it.
         if let Some(ann) = ty_ann.as_mut() {
@@ -457,6 +472,7 @@ impl<'a> TypeChecker<'a> {
         let ty = crate::hir::check::operators::round_narrow_arithmetic(expr, ty, ty_ann.as_ref());
         self.expected_type = prev_expected;
         self.current_assignment_target = None;
+        self.pending_lets.pop();
 
         let mut tmp_env = HashMap::new();
         for env in &self.consteval.env {
@@ -1402,7 +1418,13 @@ impl<'a> TypeChecker<'a> {
                 if let Some((root, path)) = Self::extract_base_and_path(lhs) {
                     self.unconsume_field(&root, &path);
                 }
-                self.drops_note_place_assign(lhs, &lhs_ty, lhs.span().line, &moved_fields_before);
+                self.drops_note_place_assign(
+                    lhs,
+                    rhs,
+                    &lhs_ty,
+                    lhs.span().line,
+                    &moved_fields_before,
+                );
             }
         }
         if let Some(op) = op {

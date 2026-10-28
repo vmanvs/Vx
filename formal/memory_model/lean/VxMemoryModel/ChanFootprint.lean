@@ -18,6 +18,9 @@ atomic (`fail_atomic`). The flags of the tasks come last, and they have only `sc
 The rule can give a place of the code a lock. The code then accesses that place only in
 `locked` blocks of the lock, and two tasks of a block can share it. `LockFootprint.lean` shows
 that such places never race.
+
+The code of a block can hold other blocks, as in `Footprint.lean` (`NestOk`). The tasks of an
+inner block count as tasks of the outer block (`allIds`).
 -/
 
 namespace Vx
@@ -82,14 +85,16 @@ theorem Stmt.Below.mono {n n' tasks : Nat} {s : Stmt} (h : s.Below n tasks) (hn 
 
 namespace ChanProg
 
-/-- A part of the code of a thread: code that starts no task, or a `tasks` block. -/
+/-- A part of the code of a thread: code that starts no task, or a `tasks` block. With `some e`,
+the block runs again in a loop while `e` holds. -/
 inductive CPhase where
   | code (s : CStmt)
-  | block (s : CStmt)
+  | block (s : CStmt) (rep : Option Expr)
 
 def CPhase.stmt : CPhase → CStmt
   | .code s => s
-  | .block s => .tasksBlock s
+  | .block s none => .tasksBlock s
+  | .block s (some e) => .loop e (.seq (.base .skip) (.seq (.tasksBlock s) (.base .skip)))
 
 /-- The phases, one after the other. -/
 def cseqAll : List CPhase → CStmt
@@ -103,24 +108,28 @@ def cthr (ps : List CPhase) (tps : Nat → List CPhase) : Nat → List CPhase
 
 variable (P : ChanProg) (g : Nat → Option Nat) (tps : Nat → List CPhase)
 
+/-- A loop around a block with no code around the block. -/
+def skipLoop (e : Expr) : TaskProg.Loop := ⟨e, .skip, .skip, trivial, trivial⟩
+
 /-- The phase of the lowered program. -/
 def CPhase.lower : CPhase → TaskProg.Phase
   | .code s => .code (P.lowerC s)
-  | .block s => .block (P.lowerC s)
+  | .block s rep => .block (P.lowerC s) (rep.map skipLoop)
 
 /-- The phases of each task, lowered. -/
 def lowerPhases (t : Nat) : List TaskProg.Phase := (tps t).map (CPhase.lower P)
 
 /-- The rule for one phase, at the places that `g` gives no lock. The code of a block and each
 task of the block are apart, and two tasks of the block are apart. The descendants of a task
-count as the task. The code of a block uses only the registers below `tmp + 3`, since the block
-keeps its marks from there. -/
+count as the task. The code of a block can hold other blocks (`NestOk`), and their tasks count as
+tasks of the block (`allIds`). The code of a block uses only the registers below `tmp + 3`, since
+the block keeps its marks from there. -/
 def CPhase.Ok : CPhase → Prop
   | .code s => s.NoTasks
-  | .block s => s.NoBlocks ∧ s.RegsBelow (P.tmp + 3) ∧
-      (∀ u ∈ (P.lowerC s).spawnIds, ∀ w, TaskProg.Desc (P.lowerPhases tps) u w →
+  | .block s _ => (P.lowerC s).NestOk (P.lowerC s).spawnIds ∧ s.RegsBelow (P.tmp + 3) ∧
+      (∀ u ∈ (P.lowerC s).allIds, ∀ w, TaskProg.Desc (P.lowerPhases tps) u w →
         s.Apart g (P.task w)) ∧
-      ∀ u ∈ (P.lowerC s).spawnIds, ∀ v ∈ (P.lowerC s).spawnIds, u ≠ v → ∀ w w',
+      ∀ u ∈ (P.lowerC s).allIds, ∀ v ∈ (P.lowerC s).allIds, u ≠ v → ∀ w w',
         TaskProg.Desc (P.lowerPhases tps) u w → TaskProg.Desc (P.lowerPhases tps) v w' →
           (P.task w).Apart g (P.task w')
 
@@ -132,8 +141,9 @@ def CPhasesOk : List CPhase → Prop
 
 /-- The rule on the code. The main code is the phases `ps`. Task `t` is the phases `tps t`, or
 code that starts no task. One thread starts each task, and a task starts only tasks with larger
-ids. `g` gives some places of the code a lock, and the code accesses such a place only in a
-`locked` block of its lock. -/
+ids. `g` gives some places of the code a lock. The code of the tasks and of the blocks of the main
+code accesses such a place only in a `locked` block of its lock. The other main code runs while
+no task runs, so it needs no lock. -/
 structure CFootprints (ps : List CPhase) : Prop where
   ok : P.Ok
   main : P.main = cseqAll ps
@@ -144,7 +154,7 @@ structure CFootprints (ps : List CPhase) : Prop where
     (∃ p ∈ cthr ps tps q', v ∈ (p.lower P).ids) → q = q'
   order : ∀ t v, (∃ p ∈ tps t, v ∈ (p.lower P).ids) → t < v
   guard : ∀ x m, g x = some m → x < P.places ∧ m < P.locks
-  guarded_main : P.main.Guarded g []
+  guarded_blocks : ∀ B rep, CPhase.block B rep ∈ ps → B.Guarded g []
   guarded_task : ∀ t, (P.task t).Guarded g []
 
 variable {P g tps}
@@ -165,8 +175,8 @@ theorem lowerC_cseqAll (ps : List CPhase) :
   induction ps with
   | nil => rfl
   | cons p ps ih =>
-    cases p <;> simp [cseqAll, CPhase.stmt, lowerC, CPhase.lower, TaskProg.seqAll,
-      TaskProg.Phase.stmt, ih]
+    rcases p with _ | ⟨_, _ | _⟩ <;> simp [cseqAll, CPhase.stmt, lowerC, CPhase.lower,
+      TaskProg.seqAll, TaskProg.Phase.stmt, skipLoop, ih]
 
 theorem not_fails (he : P.errors = false) {s : CStmt} (hs : P.StmtOk s) : ¬ s.Fails := by
   induction s with
@@ -329,11 +339,14 @@ theorem cphase_ok (htask : ∀ t, P.StmtOk (P.task t)) {p : CPhase}
     (p.lower P).Ok P.toTaskProg (P.Own g) (P.lowerPhases tps) := by
   cases p with
   | code s => exact lowerC_noTasks hp
-  | block s =>
+  | block s rep =>
     obtain ⟨hn, hr, hap, hpair⟩ := hp
-    exact ⟨lowerC_noBlocks hn, lowerC_regsBelow hr,
-      fun u hu w hw => apart_lower hs (htask w) (hap u hu w hw),
-      fun u hu v hv huv w w' hw hw' =>
+    replace hs : P.StmtOk s := by
+      cases rep with
+      | none => exact hs
+      | some _ => exact hs.2.1
+    exact ⟨hn, lowerC_regsBelow hr, fun u hu w hw => apart_lower hs (htask w) (hap u hu w hw),
+      fun u hu v hv huv _ w w' hw hw' =>
         apart_lower (htask w) (htask w') (hpair u hu v hv huv w w' hw hw')⟩
 
 theorem cphasesOk_lower (htask : ∀ t, P.StmtOk (P.task t)) :

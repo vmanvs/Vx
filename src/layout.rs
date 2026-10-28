@@ -218,13 +218,18 @@ pub struct EnumStorageLayout {
     pub slots: Vec<EnumPayloadSlot>,
 }
 
+/// Round a byte offset up without accepting invalid alignment or overflowing.
+pub fn checked_align_up(size: u64, align: u64) -> Option<u64> {
+    if !align.is_power_of_two() {
+        return None;
+    }
+    Some(size.checked_add(align - 1)? & !(align - 1))
+}
+
 /// Each position must fit every variant's value and satisfy every variant's alignment.
 pub fn enum_storage_layout(variants: &[Vec<(u64, u64)>]) -> Option<EnumStorageLayout> {
     fn round(size: u64, align: u64) -> Option<u64> {
-        if !align.is_power_of_two() {
-            return None;
-        }
-        Some(size.checked_add(align - 1)? & !(align - 1))
+        checked_align_up(size, align)
     }
     let mut result = EnumStorageLayout {
         size: 4,

@@ -6,6 +6,10 @@ on:
   pull_request:
     branches: [ main ]
 
+# `vxc --version` names the commit it was built from. See vx-build-commit/build.rs.
+env:
+  VX_VERSION_WITH_COMMIT: 1
+
 jobs:
   # Vx is built and tested against its own LLVM, from scripts/provision/build_llvm.sh, kept in
   # the GitHub Actions cache. This job builds it only when the cache does not have it; the test

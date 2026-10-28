@@ -132,6 +132,13 @@ A different display name alone does not establish a conflict.
 1. Select physical fields and retain each variant's actual payload metadata.
 1. Record the completed layout for transfer to the emitter.
 
+Concrete resolution retains declaration IDs and normalized structural arguments for active and completed layouts.
+The layout ID indexes storage but cannot establish identity alone.
+Cache reuse compares the full semantic identity, including complete frozen storage reuse.
+Active entries distinguish repeated structural identities from conflicting identities assigned the same layout ID.
+Repeated identities decline as value cycles. Identity conflicts trigger assertions containing both identities.
+Duplicate generated records also require semantic layout agreement before reuse.
+
 **Decision: any unsupported present payload declines the complete layout.**
 A variant with no value at a position contributes no requirement.
 A present value with no supported layout must not be treated as absent.
@@ -326,7 +333,9 @@ Nested-owner cleanup remains separate validation work.
 ## 10. Current limits and artifact compatibility
 
 [Lowerer::payload_field](../../src/hir/flatten.rs#L3443) does not provide unrestricted recursive layout resolution.
-An enum inside another payload enum, or a plain struct whose enum field leaves registry storage incomplete, can still decline.
+An enum inside another payload enum can still decline.
+Non-generic structs containing supported enum fields now receive complete worker-local layouts.
+Using such a struct as an outer enum payload remains guarded until its separate acceptance cases pass.
 Some generic structs containing enums already have a specialized resolution path in [Lowerer::struct_instance_layout_of](../../src/hir/flatten.rs#L3265).
 That path does not establish general nested-enum support.
 Similarly, [Lowerer::lower_ty_synth](../../src/hir/flatten.rs#L3118) handles supported concrete instances without making the free `lowered_ty` helper a recursive layout resolver.

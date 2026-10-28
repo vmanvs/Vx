@@ -61,12 +61,17 @@ pub struct Analysis {
 ///
 /// The loader takes a path, not text. These paths used to be absolute and machine-specific,
 /// so on any other machine the write failed, the failure was discarded, and analysis ran
-/// against a file that was stale or absent. Keyed by process id so two servers cannot race
-/// on one scratch file.
-fn scratch_file(stem: &str, text: &str) -> Option<String> {
-    let path = std::env::temp_dir().join(format!("vx-{stem}-{}.vx", std::process::id()));
-    std::fs::write(&path, text).ok()?;
-    Some(path.to_string_lossy().into_owned())
+/// against a file that was stale or absent. Each call gets a new file, removed when the path
+/// is dropped, so two servers, or two analyses at the same time, cannot race on one file.
+fn scratch_file(stem: &str, text: &str) -> Option<tempfile::TempPath> {
+    use std::io::Write;
+    let mut file = tempfile::Builder::new()
+        .prefix(&format!("vx-{stem}-"))
+        .suffix(".vx")
+        .tempfile()
+        .ok()?;
+    file.write_all(text.as_bytes()).ok()?;
+    Some(file.into_temp_path())
 }
 
 impl Analysis {
@@ -78,29 +83,30 @@ impl Analysis {
 
         let mut diagnostics = Vec::new();
 
-        let temp_path = match scratch_file("diagnostics", text) {
-            Some(p) => p,
-            None => return diagnostics,
+        let Some(scratch) = scratch_file("diagnostics", text) else {
+            return diagnostics;
+        };
+        let Some(temp_path) = scratch.to_str() else {
+            return diagnostics;
         };
 
         let mut loader = ModuleLoader::new();
-        if let Err(e) = loader.load_main(&temp_path) {
+        if let Err(e) = loader.load_main(temp_path) {
             let err_str = format!("{}", e);
             let mut line = 1;
             let mut col = 1;
 
+            // The header reads `Error at FILE:LINE:COL: message`. The position is the first
+            // pair of numbers after the file, which may itself hold colons.
             if let Some(idx) = err_str.find("Error at ") {
-                let rest = &err_str[idx + 9..];
-                if let Some(colon_idx) = rest.find(':') {
-                    if let Ok(l) = rest[..colon_idx].parse::<usize>() {
-                        line = l;
-                        let rest_after_col = &rest[colon_idx + 1..];
-                        if let Some(second_colon) = rest_after_col.find(':') {
-                            if let Ok(c) = rest_after_col[..second_colon].parse::<usize>() {
-                                col = c;
-                            }
-                        }
-                    }
+                let header = err_str[idx + 9..].lines().next().unwrap_or("");
+                let fields: Vec<&str> = header.split(':').collect();
+                if let Some((l, c)) = fields
+                    .windows(2)
+                    .find_map(|w| Some((w[0].parse::<usize>().ok()?, w[1].parse::<usize>().ok()?)))
+                {
+                    line = l;
+                    col = c;
                 }
             }
 
@@ -209,10 +215,10 @@ impl Analysis {
         let word_sym: crate::symbol::Symbol = word.clone().into();
 
         // 2. Load the environment to resolve the word
-        let temp_path = scratch_file("hover", text)?;
+        let scratch = scratch_file("hover", text)?;
         let mut loader = ModuleLoader::new();
         // A module that fails to load still resolves whatever parsed, so hover proceeds.
-        let _ = loader.load_main(&temp_path);
+        let _ = loader.load_main(scratch.to_str()?);
 
         let modules: Vec<_> = loader.loaded_modules.values().cloned().collect();
         let global_env_modules: Vec<_> = modules.iter().map(|m| m.clone_signature()).collect();
@@ -384,6 +390,26 @@ mod tests {
         assert!(
             !messages.iter().any(|m| m.contains("Type mismatch")),
             "{messages:?}"
+        );
+    }
+
+    /// The parse error header reads `Error at FILE:LINE:COL: ...`, and the position is read
+    /// from after the file, which used to put every parse error at 1:1.
+    #[test]
+    fn a_parse_error_is_placed_at_its_line_and_column() {
+        let mut host = AnalysisHost::new();
+        host.apply_change(
+            "file:///a.vx".to_string(),
+            "fn main() -> i32 {\n  let x = 10 return x;\n}\n".to_string(),
+        );
+        let diags = host.snapshot().diagnostics("file:///a.vx");
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        // Line 2, column 14 in the source; the IDE counts both from zero.
+        assert_eq!(
+            (diags[0].line_start, diags[0].col_start),
+            (1, 13),
+            "{:?}",
+            diags[0]
         );
     }
 }

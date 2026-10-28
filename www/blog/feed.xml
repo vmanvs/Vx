@@ -5,8 +5,26 @@
   <link href="https://vxlang.org/blog/feed.xml" rel="self"/>
   <link href="https://vxlang.org/blog/"/>
   <id>https://vxlang.org/blog/</id>
-  <updated>2026-10-24T18:00:00Z</updated>
+  <updated>2026-10-27T18:00:00Z</updated>
   <author><name>Aditya Kumar</name></author>
+
+  <entry>
+    <title>Design visibility, builds and versions together</title>
+    <link href="https://vxlang.org/blog/design-visibility-builds-and-versions-together.html"/>
+    <id>https://vxlang.org/blog/design-visibility-builds-and-versions-together.html</id>
+    <updated>2026-10-27T18:00:00Z</updated>
+    <author><name>Aditya Kumar</name></author>
+    <summary>Three tools in a programming language depend on the public interface of a package: the visibility rules, the build system and the package manager. When a language designs them separately, they disagree. In C++, a private field makes other files rebuild. In Rust, splitting a slow crate makes private items public, and the package manager must then version them. Swift added a package keyword nine years after 1.0 to match its package manager. The idea is to define the interface once and let all three tools read it. That needs a signature that holds the whole interface, and visibility levels that match the units of the build system and the package manager. In Vx, the planned levels private, pkg, ws and pub each answer three questions: who can call this, what rebuilds when it changes, and which version bump the change needs. Today vxc writes interface files and vx-api diff computes the version bump, but pkg and ws do not exist yet, so vx-api treats every item as public.</summary>
+  </entry>
+
+  <entry>
+    <title>Two bugs the H100 did not show</title>
+    <link href="https://vxlang.org/blog/two-bugs-the-h100-did-not-show.html"/>
+    <id>https://vxlang.org/blog/two-bugs-the-h100-did-not-show.html</id>
+    <updated>2026-10-27T18:00:00Z</updated>
+    <author><name>Aditya Kumar</name></author>
+    <summary>Vx's memory model forbids load buffering with relaxed atomics, as RC11 does, so that no value comes out of thin air. herd7, memalloy and Lean check the model, but nothing checked the GPU code that vxc generates. Five of the model's litmus tests, written as Vx programs, ran 11 times each on an H100, with 100,000 rounds per run and a stress version of each. Every run printed 0, also the two controls whose result the model allows, so this setup showed no weak result at all. Reading the PTX found two bugs. vxc generated ld.relaxed then st.relaxed, which the PTX model may reorder, so vxc now makes each relaxed atomic read an acquire read, unless a program asks for -fweak-relaxed-atomics. And LLVM 22's NVPTX back end gave every atomicrmw the same relaxed atom, whatever its order. vxc now puts the order in fences around a relaxed atom, as NVIDIA's mapping for C++ allows. LLVM fixed this upstream in LLVM 23. We have not measured the cost of either fix on a GPU yet.</summary>
+  </entry>
 
   <entry>
     <title>GLM on an A100, in Vx</title>

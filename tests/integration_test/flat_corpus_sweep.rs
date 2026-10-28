@@ -32,8 +32,7 @@ const KNOWN_DECLINES: &[&str] = &[
     // pointer): the flat path only fills the destination in place, and declines the rest.
     "backend/pass/matmul_assign_alias.vx",
     "backend/pass/matmul_into_a_tensor_read_through_a_view.vx",
-    // A tuple holding an `Option<i32>`: the flat path has no layout for a generic struct holding
-    // an enum ("a struct with no GID"), and it also declines a `match` used as a value.
+    // The tuple's enum subject has no concrete type recorded for the flat match path.
     "backend/pass/tuple_match_with_enum_variants_as_a_value.vx",
     // A row chosen by an `if` used as a value: the flat path has no slot for a tensor view
     // ("an aggregate slot with no struct type").
@@ -41,9 +40,6 @@ const KNOWN_DECLINES: &[&str] = &[
     // `let u = if c { ..; };`: the flat path declines a `let` of a `void` value, with or
     // without `: void` ("a let with no type annotation"). The file is about the AST path.
     "backend/pass/if_else_with_no_value_bound_by_let.vx",
-    // A `match` that gives a `bool`: the flat path declines a match used as a value. The file
-    // is about the AST path.
-    "optimizations/pass/match_that_gives_a_bool.vx",
     // A struct passed to `grad`: the flat path declines it ("an autodiff argument that is not a
     // scalar"). The file is about the AST path.
     "backend/pass/autodiff/autodiff_for_variable_argument.vx",
@@ -76,6 +72,8 @@ const KNOWN_DECLINES: &[&str] = &[
     "backend/pass/closure_literal_as_closure_value.vx",
     // "A store to a nested nominal field": `out.f = f` puts a closure into a struct's field.
     "backend/pass/closure_using_a_local_stays_in_its_function.vx",
+    // "A store to a nested nominal field": `r[0].name = x` puts a struct into a struct's field.
+    "backend/pass/assign_to_a_field_through_index_mut_drops_the_old_field.vx",
     // `Option::take` writes through `&mut Option<T>`, which the flat path declines as "a
     // pointer element type that is not modelled". The answers come from the AST path.
     "backend/pass/core_option.vx",
@@ -254,6 +252,15 @@ fn decline_keys(log: &str) -> Vec<String> {
         .collect()
 }
 
+/// `--package tests=<repository>/tests`: some fixtures import other test files from `tests`.
+fn tests_package() -> [String; 2] {
+    let tests = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+    [
+        "--package".to_string(),
+        format!("tests={}", tests.display()),
+    ]
+}
+
 /// Compile one program and report the path it took. `--action emit-mlir` stops at
 /// MLIR, so no accelerator or JIT is needed and the answer is the same everywhere.
 ///
@@ -262,6 +269,7 @@ fn decline_keys(log: &str) -> Vec<String> {
 fn path_taken(program: &Path) -> Result<CodegenPath, String> {
     let output = Command::new(env!("CARGO_BIN_EXE_vxc"))
         .arg(program)
+        .args(tests_package())
         .args(["--action", "emit-mlir"])
         .env("VX_FLAT_DBG", "1")
         .output()
@@ -364,6 +372,10 @@ fn flat_path_coverage_of_the_backend_corpus_holds() {
             "optimizations/pass/code_after_the_blocks_runs_on_the_lanes_of_one_block.vx", // needs --machine
             "optimizations/pass/code_of_a_group_runs_in_its_last_pass.vx", // needs --machine
             "optimizations/pass/code_of_a_group_in_a_kernel_launched_again.vx", // needs --machine
+            "optimizations/pass/a_library_tells_the_backend_its_gpus.vx",  // needs --machine
+            "optimizations/pass/splits_read_from_gpu_memory.vx",           // needs --machine
+            "optimizations/pass/a_kernel_tells_ptxas_its_block_size.vx",   // needs --machine
+            "optimizations/pass/atomic_orders_and_fence_scopes_in_ptx.vx", // needs --machine
             "optimizations/pass/code_after_the_blocks_in_a_kernel_for_emit_ptx.vx", // needs --machine
             "optimizations/pass/across_loops_with_auto_schedule_levels_carry_their_level.vx", // needs -f
             "frontend/pass/packages/import_from_a_package.vx", // needs --package
@@ -578,6 +590,7 @@ fn flat_path_answers_match_the_backend_expectations() {
 
         let output = match Command::new(env!("CARGO_BIN_EXE_vxc"))
             .arg(&program)
+            .args(tests_package())
             .env("PATH", &path_var)
             .env("VX_FLAT_DBG", "1")
             .output()
