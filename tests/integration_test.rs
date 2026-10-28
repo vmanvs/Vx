@@ -10,8 +10,11 @@ mod integration_test {
     mod basic_integration;
     mod benchmarks_report_metrics;
     mod borrow_test;
+    mod build_commit_in_the_version;
     mod codegen_determinism;
+    mod collective_test;
     mod compile_test;
+    mod compile_time_of_vec_calls;
     mod comptime_twins;
     mod cross_call_capacity_test;
     mod device_image_test;
@@ -35,6 +38,7 @@ mod integration_test {
     mod missing_solver_test;
     mod mlir_diagnostic_test;
     mod module_api_test;
+    mod output_does_not_depend_on_the_current_directory;
     mod payload_test;
     mod pipeline_scale_test;
     mod registry_test;
@@ -49,6 +53,7 @@ mod integration_test {
     // It links with `cc -shared` and loads `.so` files.
     #[cfg(target_os = "linux")]
     mod two_kernel_libraries_in_one_process;
+    mod vx_api_diff;
     mod wire_test;
     mod working_set_peak_test;
 }

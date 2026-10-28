@@ -1458,6 +1458,17 @@ fn flat_declines_an_enum_with_an_unsupported_generic_payload() {
     );
 }
 
+#[rstest::rstest]
+#[case::normal(None)]
+#[case::parallel(Some(2))]
+fn non_generic_struct_with_an_option_field_runs(#[case] jobs: Option<usize>) {
+    assert_generated_aggregate_runs(
+        "error_with_an_optional_code.vx",
+        &["-7", "99", "-7", "99"],
+        jobs,
+    );
+}
+
 fn assert_enum_layout_falls_back(jobs: Option<usize>) {
     use melior::ir::operation::OperationLike;
 
@@ -2384,6 +2395,8 @@ fn program_links_a_function_body_from_a_vxlib_artifact() {
         is_unsafe: false,
         is_pub: false,
         name: body.name.clone(),
+        span: vxc::syntax::Span::default(),
+        file: None,
         generics: vec![],
         params: body
             .params
@@ -3021,7 +3034,6 @@ fn driver_import_runs_cross_module_scalar_references() {
 
     let run = Command::new(vxc)
         .args([app.to_str().unwrap(), "--run"])
-        .env("VX_STD_PATH", dir.to_str().unwrap())
         .env("RUST_BACKTRACE", "1")
         .output()
         .expect("run");
@@ -3073,10 +3085,9 @@ fn driver_import_auto_resolves_a_vxlib_artifact() {
     // Delete the library source: the import must resolve *purely* to the artifact.
     std::fs::remove_file(&lib).unwrap();
 
-    // No --link-interface flag; VX_STD_PATH makes `import mathlib;` resolve to `<dir>/mathlib.vxlib`.
+    // No --link-interface flag: `import mathlib;` resolves to the `mathlib.vxlib` beside the program.
     let run = Command::new(vxc)
         .args([app.to_str().unwrap(), "--run"])
-        .env("VX_STD_PATH", dir.to_str().unwrap())
         .env("RUST_BACKTRACE", "1")
         .output()
         .expect("run");
@@ -3135,7 +3146,6 @@ fn driver_import_uses_a_struct_from_a_vxlib() {
 
     let run = Command::new(vxc)
         .args([app.to_str().unwrap(), "--run"])
-        .env("VX_STD_PATH", dir.to_str().unwrap())
         .env("RUST_BACKTRACE", "1")
         .output()
         .expect("run");
@@ -3189,7 +3199,6 @@ fn driver_import_constructs_a_struct_from_a_vxlib() {
 
     let run = Command::new(vxc)
         .args([app.to_str().unwrap(), "--run"])
-        .env("VX_STD_PATH", dir.to_str().unwrap())
         .env("RUST_BACKTRACE", "1")
         .output()
         .expect("run");
@@ -4062,6 +4071,167 @@ fn a_generic_over_two_tensor_shapes_gets_two_monomorphs() {
     );
 }
 
+#[rstest::rstest]
+#[case(0, 7)]
+#[case(1, 9)]
+fn flat_matches_ast_returned_match_value(#[case] input: i32, #[case] expected: i32) {
+    assert_parity(
+        &format!("fn main() -> i32 {{ return match {input} {{ 0 => {{ 7 }}, _ => {{ 9 }}, }}; }}"),
+        expected,
+    );
+}
+
+#[test]
+fn flat_matches_ast_match_value_in_local_and_call() {
+    assert_parity(
+        "fn add_one(x: i32) -> i32 { return x + 1; }
+        fn main() -> i32 {
+            let n = match 0 { 0 => { 7 }, _ => { 9 }, };
+            return add_one(match n { 7 => { 20 }, _ => { 30 }, });
+        }",
+        21,
+    );
+}
+
+#[test]
+fn flat_matches_ast_nested_match_value() {
+    assert_parity(
+        "fn main() -> i32 {
+        return if true { match 1 { 0 => { 7 }, _ => { 9 }, } } else { 3 };
+    }",
+        9,
+    );
+}
+
+#[test]
+fn flat_matches_ast_match_value_with_side_effects() {
+    assert_parity(
+        "fn main() -> i32 {
+        let mut count = 0;
+        let value = match 0 {
+            0 => { count += 1; 7 },
+            _ => { count += 10; 9 },
+        };
+        return value + count;
+    }",
+        8,
+    );
+}
+
+#[test]
+fn flat_matches_ast_enum_match_value() {
+    assert_parity(
+        "enum Choice { First, Second }
+        fn main() -> i32 {
+            return match Choice::Second {
+                Choice::First => { 7 }, Choice::Second => { 9 },
+            };
+        }",
+        9,
+    );
+}
+
+#[test]
+fn flat_matches_ast_payload_match_value() {
+    assert_parity(
+        "enum Number { Some(i32), None }
+        fn main() -> i32 {
+            let n = Number::Some(12);
+            return match n { Number::Some(value) => { value }, Number::None => { 0 }, };
+        }",
+        12,
+    );
+}
+
+#[test]
+fn flat_matches_ast_match_value_with_early_return() {
+    assert_parity(
+        "fn main() -> i32 {
+        return match 0 { 0 => { return 7; }, _ => { 9 }, };
+    }",
+        7,
+    );
+}
+
+// Each case checks both possible Boolean results. The older generator supplies a working baseline.
+// The default generator must also succeed, so missing inference cannot pass through fallback.
+#[rstest::rstest]
+#[case::comparison("a == a", "a == b")]
+#[case::boolean_literals("true", "false")]
+#[case::logical_and("a && a", "a && b")]
+#[case::logical_or("b || a", "b || b")]
+fn boolean_match_result_inference(#[case] true_expr: &str, #[case] false_expr: &str) {
+    for (subject, expected) in [(0, 7), (1, 9)] {
+        let src = format!(
+            "fn choose(n: i32, a: bool, b: bool) -> bool {{
+                return match n {{ 0 => {{ {true_expr} }}, _ => {{ {false_expr} }}, }};
+            }}
+            fn main() -> i32 {{
+                if choose({subject}, true, false) {{ return 7; }}
+                return 9;
+            }}"
+        );
+        assert_eq!(
+            ast_exit_code(&src),
+            expected,
+            "older generator: subject {subject}"
+        );
+        let flat = flat_exit_code(&src)
+            .expect("the default generator must infer the Boolean match result");
+        assert_eq!(flat, expected, "default generator: subject {subject}");
+    }
+}
+
+#[rstest::rstest]
+#[case(0, 77)]
+#[case(1, 99)]
+fn struct_match_result_from_construction(#[case] subject: i32, #[case] expected: i32) {
+    let src = format!(
+        "struct Point {{ x: i32, y: i32 }}
+        fn choose(n: i32) -> Point {{
+            return match n {{
+                0 => {{ Point {{ x: 7, y: 70 }} }},
+                _ => {{ Point {{ x: 9, y: 90 }} }},
+            }};
+        }}
+        fn main() -> i32 {{ let p = choose({subject}); return p.x + p.y; }}"
+    );
+    assert_eq!(ast_exit_code(&src), expected);
+    assert_parity(&src, expected);
+}
+
+#[rstest::rstest]
+#[case(0, 77)]
+#[case(1, 99)]
+fn struct_match_result_from_local(#[case] subject: i32, #[case] expected: i32) {
+    let src = format!(
+        "struct Point {{ x: i32, y: i32 }}
+        fn choose(n: i32) -> Point {{
+            let left = Point {{ x: 7, y: 70 }};
+            let right = Point {{ x: 9, y: 90 }};
+            return match n {{ 0 => {{ left }}, _ => {{ right }}, }};
+        }}
+        fn main() -> i32 {{ let p = choose({subject}); return p.x + p.y; }}"
+    );
+    assert_eq!(ast_exit_code(&src), expected);
+    assert_parity(&src, expected);
+}
+
+#[rstest::rstest]
+#[case(0, 77)]
+#[case(1, 99)]
+fn struct_if_result_from_construction(#[case] subject: i32, #[case] expected: i32) {
+    let src = format!(
+        "struct Point {{ x: i32, y: i32 }}
+        fn choose(n: i32) -> Point {{
+            return if n == 0 {{ Point {{ x: 7, y: 70 }} }} else {{ Point {{ x: 9, y: 90 }} }};
+        }}
+        fn main() -> i32 {{ let p = choose({subject}); return p.x + p.y; }}"
+    );
+    assert_eq!(ast_exit_code(&src), expected);
+    assert_parity(&src, expected);
+}
+
 // Native output alone cannot detect merging two identity functions with pointer arguments.
 // Also inspect the generated definitions and the targets their calls select.
 #[rstest::rstest]
@@ -4172,4 +4342,67 @@ fn enum_shared_storage_preserves_all_payload_bits(
         _ => &["4294967301", "1.5", "29"],
     };
     assert_generated_aggregate_runs_at_optimization(fixture, expected, jobs, optimization);
+}
+
+#[rstest::rstest]
+#[case(0, 40)]
+#[case(1, 3)]
+fn match_constructs_an_enum_result(#[case] subject: i32, #[case] expected: i32) {
+    let src = format!("enum Shape {{ Square(i32), Empty }}
+        fn choose(n: i32) -> Shape {{
+            return match n {{ 0 => {{ Shape::Square(40) }}, _ => {{ Shape::Empty }}, }};
+        }}
+        fn main() -> i32 {{
+            let shape = choose({subject});
+            match shape {{ Shape::Square(value) => {{ return value; }}, Shape::Empty => {{ return 3; }}, }}
+        }}");
+    assert_eq!(ast_exit_code(&src), expected);
+    assert_parity(&src, expected);
+}
+
+#[rstest::rstest]
+#[case(0, 40)]
+#[case(1, 3)]
+fn match_constructs_a_local_enum_result(#[case] subject: i32, #[case] expected: i32) {
+    let src = format!("enum Shape {{ Square(i32), Empty }}
+        fn main() -> i32 {{
+            let shape = match {subject} {{ 0 => {{ Shape::Square(40) }}, _ => {{ Shape::Empty }}, }};
+            match shape {{ Shape::Square(value) => {{ return value; }}, Shape::Empty => {{ return 3; }}, }}
+        }}");
+    // The older generator cannot infer this local match result. Check the default generator directly.
+    assert_flat_exit(&src, expected);
+}
+
+#[rstest::rstest]
+#[case(0, 40)]
+#[case(1, 3)]
+fn match_constructs_a_generic_enum_result(#[case] subject: i32, #[case] expected: i32) {
+    let src = format!("enum Choice<T> {{ Some(T), None }}
+        fn choose(n: i32) -> Choice<i64> {{
+            return match n {{ 0 => {{ Choice<i64>::Some(40i64) }}, _ => {{ Choice<i64>::None() }}, }};
+        }}
+        fn main() -> i32 {{
+            let choice = choose({subject});
+            match choice {{ Choice<i64>::Some(value) => {{ return value as i32; }}, Choice<i64>::None() => {{ return 3; }}, }}
+        }}");
+    assert_eq!(ast_exit_code(&src), expected);
+    assert_parity(&src, expected);
+}
+
+#[rstest::rstest]
+#[case(0, 40)]
+#[case(1, 3)]
+fn match_constructs_a_payload_free_enum_result(#[case] subject: i32, #[case] expected: i32) {
+    let src = format!(
+        "enum Color {{ Red, Blue }}
+        fn choose(n: i32) -> Color {{
+            return match n {{ 0 => {{ Color::Red }}, _ => {{ Color::Blue }}, }};
+        }}
+        fn main() -> i32 {{
+            let color = choose({subject});
+            match color {{ Color::Red => {{ return 40; }}, Color::Blue => {{ return 3; }}, }}
+        }}"
+    );
+    assert_eq!(ast_exit_code(&src), expected);
+    assert_parity(&src, expected);
 }

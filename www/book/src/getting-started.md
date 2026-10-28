@@ -78,6 +78,11 @@ complaint you are already working. To check by hand:
 vxc --version
 ```
 
+This prints the version, and for a release build also the commit it was built from, such as
+`vxc 0.0.3 (f1fb0333)`. To get the commit in a build of your own, set `VX_VERSION_WITH_COMMIT=1`
+when you run `cargo build`. Keep that line with anything you report: two builds of the same
+version can generate different code.
+
 Then compile something. Note that `--run` propagates *the program's own* exit code, so a non-zero
 exit status here is your program's return value rather than a failure:
 

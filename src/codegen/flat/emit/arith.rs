@@ -11,7 +11,7 @@ impl FnEmit<'_> {
         let mt = mlir_scalar(&e).ok_or(crate::emitter_gap!())?;
         let lit = if e.is_float() {
             let v = f64::from_bits(ins.imm);
-            mlir_float_literal(e.nearest_narrow_value(v).unwrap_or(v))
+            mlir_float_literal(e.nearest_narrow_value(v).unwrap_or(v), &e)
         } else if !is_signed(&e) && int_bits(&e).is_some_and(|b| b > 64) {
             // The literal holds 64 bits. A wider unsigned type fills the rest with zeroes, so
             // `2^64 - 1` stays positive in a `u128`.
@@ -442,7 +442,7 @@ impl FnEmit<'_> {
                 std::cmp::Ordering::Equal => {
                     return Err(Decline::TypeNotModelled {
                         what: "a slice cast between two equal-width float types",
-                    })
+                    });
                 }
             };
             let n = format!("%v{idx}");

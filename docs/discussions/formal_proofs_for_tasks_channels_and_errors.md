@@ -62,7 +62,8 @@ Step 1b:
 - The marks are registers, not places in memory. The model has no initial values and no total
   `co`, so a thread can read an old write of its own to a place.
 - `block_hb` (`Blocks.lean`): each access of each task that a block started happens before the
-  code after the block. The body must not hold another `tasks` block.
+  code after the block. `block_hb_nested` allows a body that holds other `tasks` blocks, when each
+  inner block starts only tasks that the blocks around it do not start (#2243).
 - `TaskProg.Ok` allows `tasksBlock`, and `fork_hb`, `join_hb` and `drf_sc` cover its lowering. So
   `addJoins_ok` is not a separate theorem.
 
@@ -133,6 +134,7 @@ the library. `ChanProg.drf_sc` is the DRF-SC theorem. Step 4 adds the two theore
   reads one. Each access of element `k` comes after the `fetchAdd` that gave its thread the number
   `k`. So the `recv` with the number `k` gets a value that the `send` with the number `k` wrote.
   `ring_once` shows that two reads of the same write belong to the same `recv`.
+  `ring_move_once` shows that each operation accesses its element once.
 
 DRF-SC for a client holds only with this `sc` library. A later step can make an access release or
 acquire. Each such access then needs its own edge proof and a litmus test.
@@ -212,7 +214,14 @@ descendants of a task as its own (`Desc`). One thread starts each task, and a ta
 tasks with larger ids. The proof finds where two threads are in the tree of tasks: one starts the
 other at some depth (`anc`), or two tasks of one block start them (`sib`). The sixth part gives
 the same tree of tasks to `ChanFootprint.lean`, so a task with channels, locks or failures can
-also start tasks.
+also start tasks. The seventh part makes the lock rule less strict. The main code outside its
+blocks accesses a place of a lock without the lock, because no task runs then (`main_task`). The
+eighth part lets a block run in a loop. Each pass joins its tasks, so the rule of the block holds
+for each pass (`Runs.loop_pass`). In `Footprint.lean` the loop can also run code that starts no
+task before and after the block (#2241). Two tasks that one `spawn` of the block starts need not
+be apart, because one pass starts at most one of them (#2242). The ninth part lets the code of a
+block in `Footprint.lean` hold other blocks (#2285). The tasks of an inner block count as tasks of
+the outer block. `ChanFootprint.lean` and `LockFootprint.lean` allow it too (#2286).
 
 ## Later
 
@@ -227,6 +236,14 @@ also start tasks.
 - **A typed layer.** References, `&` and `&mut`, structs, raw pointers, `SharedCell`, `Send` and
   `Sync` (S1 to S4), M5 and T3. The theorem: a well-typed program follows the footprint rule of
   step 6. It is a syntactic proof, not a semantic model as in RustBelt.
+  #2244 has the design. `Typed.lean` has the first part: locals, structs, cells, atomics, and
+  captures by `move`, `ref` and `mut`. The second part adds references `&x` and `&mut x` as
+  locals. `TypedChan.lean` has the third part: channels, and locals in a mutex. T3 is in
+  `Typed.lean`: a local can live in one phase only, and locals of different phases share a slot.
+  `TypedChan.lean` does not have scopes. The fourth part adds raw pointers and `unsafe impl Send`
+  and `Sync` (S3) to `Typed.lean`. The claims of the `unsafe` code and of each `unsafe impl` are
+  a hypothesis of the theorems. A task is a closure, so S4 is the rule for `spawn`.
+  `TypedChan.lean` has no raw pointers.
 - **Release and acquire in the library**, one access at a time (step 4).
 
 ## What Lean does not cover

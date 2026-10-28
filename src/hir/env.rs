@@ -527,6 +527,9 @@ pub struct TypeChecker<'a> {
     /// functions). Saved and restored around `check_function` like `current_return_type`.
     pub(crate) current_function: String,
     pub(crate) current_assignment_target: Option<String>,
+    /// Each `let` whose value is being checked, with the depth its variable will be held at. A
+    /// borrow made in a block inside the value, `if c { &mut x } else { .. }`, outlives that block.
+    pub(crate) pending_lets: Vec<(String, usize)>,
     /// Tracks which variables have been read during the current function check.
     pub(crate) used_vars: std::collections::HashSet<crate::symbol::Symbol>,
     /// Tracks declared variables with their spans (for unused variable warnings).
@@ -605,6 +608,7 @@ impl<'a> TypeChecker<'a> {
             current_return_type: None,
             current_function: String::new(),
             current_assignment_target: None,
+            pending_lets: Vec::new(),
             used_vars: std::collections::HashSet::new(),
             declared_vars: Vec::new(),
             declared_mut_vars: Vec::new(),
@@ -679,13 +683,28 @@ impl<'a> TypeChecker<'a> {
         // Lexical Lifetime cleanup: Remove borrows originating in this scope. A borrow
         // recorded at depth `d` was made when `scopes.len()` was `d`, so a variable of scope
         // `i` is held at depth `i + 1`.
-        let scopes = &self.scopes;
-        self.borrow.retain_scope(depth, |name| {
-            scopes
-                .iter()
-                .rposition(|s| s.contains_key(name))
-                .map(|i| i + 1)
-        });
+        let (scopes, pending) = (&self.scopes, &self.pending_lets);
+        self.borrow
+            .retain_scope(depth, |name| Self::holder_depth(scopes, pending, name));
+    }
+
+    /// The depth to which a borrow held by `name` lasts: one past the innermost scope that
+    /// declares `name`, or the depth of a `let` that declares it once its value is checked.
+    fn holder_depth(
+        scopes: &[HashMap<crate::symbol::Symbol, (Type, Topology)>],
+        pending_lets: &[(String, usize)],
+        name: &str,
+    ) -> Option<usize> {
+        let declared = scopes
+            .iter()
+            .rposition(|s| s.contains_key(name))
+            .map(|i| i + 1);
+        let pending = pending_lets
+            .iter()
+            .rev()
+            .find(|(n, _)| n == name)
+            .map(|(_, d)| *d);
+        declared.max(pending)
     }
 
     /// After an expression statement: put back the borrow table from before it, which ends
@@ -707,14 +726,14 @@ impl<'a> TypeChecker<'a> {
                 self.borrow.record(&base, record);
                 continue;
             }
-            let Some(scope) = record
+            let Some(held_at) = record
                 .borrower_name
                 .as_deref()
-                .and_then(|n| self.scope_of(n))
+                .and_then(|n| Self::holder_depth(&self.scopes, &self.pending_lets, n))
             else {
                 continue;
             };
-            record.scope_depth = record.scope_depth.min(scope + 1);
+            record.scope_depth = record.scope_depth.min(held_at);
             self.borrow.record(&base, record);
         }
     }
@@ -1670,6 +1689,8 @@ impl<'a> TypeChecker<'a> {
             where_transfers: Vec::new(),
             body: new_body,
             doc_comment: generic_func.doc_comment.clone(),
+            span: generic_func.span,
+            file: generic_func.file.clone(),
         })
     }
 
@@ -1681,6 +1702,9 @@ impl<'a> TypeChecker<'a> {
         if !func.generics.is_empty() {
             return;
         }
+        // Diagnostics name the file the function is written in, even when it is a generic
+        // instance or a copied default checked from inside another file's function.
+        let prev_file = std::mem::replace(&mut self.errors.file, func.file.clone());
 
         // `main` is the C entry point: its return value is the process exit code,
         // so it must return i32 (#210). A non-i32 `main` is a hard error rather
@@ -1925,10 +1949,14 @@ impl<'a> TypeChecker<'a> {
                 && name_str != "self"
                 && !self.used_vars.contains(param_name.as_ref())
             {
+                // A function built in memory, such as a copied trait default, has no position
+                // of its own; `0:0` would point nowhere.
+                let at = (func.span.line > 0)
+                    .then(|| crate::diagnostic::SourceSpan::from_ast_span(&func.span));
                 self.errors.warn(
                     crate::diagnostic::DiagnosticCode::W1009,
                     format!("Unused function parameter '{}'", param_name),
-                    None,
+                    at,
                 );
             }
         }
@@ -1978,7 +2006,7 @@ impl<'a> TypeChecker<'a> {
         }
         // E6032: an `across` loop in a place or with a size that it may not have.
         if !self.speculating {
-            self.check_across_loops(&mut func.body);
+            self.check_across_loops(&func.params, &mut func.body);
         }
 
         // The whole function has been checked; verify the working set of each memory space
@@ -2014,6 +2042,7 @@ impl<'a> TypeChecker<'a> {
         self.in_unsafe_block = prev_in_unsafe;
         self.in_written_unsafe_block = prev_written_unsafe;
         self.unsafe_op_seen = prev_unsafe_op_seen;
+        self.errors.file = prev_file;
     }
 
     pub fn parse_ty_str(&self, s: &str) -> Type {

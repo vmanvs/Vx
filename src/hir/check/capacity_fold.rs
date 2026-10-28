@@ -42,6 +42,8 @@ pub struct CallEdge {
 #[derive(Debug, Clone)]
 pub struct FnCapacitySummary {
     pub name: String,
+    /// The file the function is written in, for the diagnostics the fold reports about it.
+    pub file: Option<crate::symbol::Symbol>,
     /// Peak resident bytes per space over this function's own placements.
     pub self_peak: BTreeMap<String, u64>,
     pub calls: Vec<CallEdge>,
@@ -107,6 +109,9 @@ fn fold_with_budgets(
     let mut peak_edge: Vec<BTreeMap<String, usize>> = vec![BTreeMap::new(); nodes.len()];
     let mut reported: Vec<BTreeMap<String, bool>> = vec![BTreeMap::new(); nodes.len()];
 
+    // Each report below names its own function's file. Put back the caller's file after.
+    let caller_file = errors.file.clone();
+
     // Tarjan emits SCCs in reverse topological order: every callee's component
     // before its callers'. Fold in that order, so `total` of a callee is final
     // by the time a caller reads it.
@@ -165,6 +170,7 @@ fn fold_with_budgets(
             );
         }
     }
+    errors.file = caller_file;
 }
 
 /// Refuse a call path whose folded peak exceeds a space's capacity, unless the
@@ -240,6 +246,7 @@ fn report_overflow(
         available_bytes: budget.cap,
         tiles: None,
     };
+    errors.file = nodes[n].file.clone();
     if budget.overcommit {
         errors
             .warn(
@@ -325,6 +332,8 @@ fn fold_cycle(
             available_bytes: budget.cap,
             tiles: None,
         };
+        // The cycle is reported once; it is named from its first function's file.
+        errors.file = scc.first().and_then(|&i| nodes[i].file.clone());
         if budget.overcommit {
             errors
                 .warn(
@@ -418,6 +427,7 @@ mod tests {
     ) -> FnCapacitySummary {
         FnCapacitySummary {
             name: name.to_string(),
+            file: None,
             self_peak: peaks.iter().map(|(s, b)| (s.to_string(), *b)).collect(),
             calls: calls
                 .iter()
@@ -594,5 +604,21 @@ mod tests {
             summary("g", &[("DRAM", 100)], &[]),
         ];
         assert!(run(&s, &[("W", 4, false)]).is_empty());
+    }
+
+    /// A refusal names the file of the function it is about. After the fold, the caller's
+    /// next diagnostic names the caller's file again.
+    #[test]
+    fn a_refusal_names_its_function_s_file_and_the_caller_s_file_comes_back() {
+        let mut f = summary("f", &[("W", 3)], &[("g", &[("W", 3)])]);
+        f.file = Some("f.vx".into());
+        let mut g = summary("g", &[("W", 3)], &[]);
+        g.file = Some("g.vx".into());
+        let mut errors = crate::diagnostic::DiagnosticsVec::new();
+        errors.file = Some("main.vx".into());
+        fold_with_budgets(&[f, g], &budgets(&[("W", 4, false)]), &mut errors);
+        let diags: Vec<String> = errors.iter().map(|d| d.to_string()).collect();
+        assert!(diags.len() == 1 && diags[0].contains(" f.vx:"), "{diags:?}");
+        assert_eq!(errors.file, Some("main.vx".into()));
     }
 }

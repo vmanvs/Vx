@@ -3491,6 +3491,18 @@ struct ConvertVxToStandardPass
           kernel.getLoc(), kernel.getSymName(), funcType);
       gpuFunc->setAttr(gpu::GPUDialect::getKernelFuncAttrName(),
                        inner.getUnitAttr());
+      // A block size that is a number is the block of every launch. ptxas
+      // then uses few enough registers for a block of that size. Without it,
+      // a large kernel can get a thread limit below its block. A block of at
+      // most 256 threads fits at 255 registers each, the most ptxas gives.
+      // The limit also changes how ptxas picks registers, so a smaller block
+      // gets none.
+      if (auto block = kernel->getAttrOfType<StringAttr>("vx.launch_block")) {
+        int32_t threads = 0;
+        if (!block.getValue().getAsInteger(10, threads) && threads > 256)
+          gpuFunc->setAttr("nvvm.maxntid",
+                           inner.getDenseI32ArrayAttr({threads, 1, 1}));
+      }
 
       // The whole region, not its entry block. What the outliner produces is
       // raw CFG -- `cf.br` and `cf.cond_br` over a dozen blocks, every
@@ -4964,6 +4976,74 @@ static std::string deviceLibdevice() {
   return {};
 }
 
+/// The memory model forbids load buffering, as RC11 does: a relaxed read and a
+/// write after it are not reordered, so no value comes out of thin air
+/// (formal/memory_model/tests/load_buffering_relaxed.litmus). PTX and AArch64
+/// may move a relaxed load after a later store, so every relaxed read becomes
+/// an acquire read: loads, read-modify-writes and compare-and-swaps. A module
+/// with `vx.weak_relaxed_atomics`, from `-fweak-relaxed-atomics`, keeps them
+/// relaxed.
+static void orderRelaxedReads(Operation *root) {
+  auto withAcquire = [](LLVM::AtomicOrdering o) {
+    if (o == LLVM::AtomicOrdering::monotonic)
+      return LLVM::AtomicOrdering::acquire;
+    if (o == LLVM::AtomicOrdering::release)
+      return LLVM::AtomicOrdering::acq_rel;
+    return o;
+  };
+  root->walk([&](Operation *op) {
+    if (auto load = dyn_cast<LLVM::LoadOp>(op)) {
+      if (load.getOrdering() == LLVM::AtomicOrdering::monotonic)
+        load.setOrdering(LLVM::AtomicOrdering::acquire);
+    } else if (auto rmw = dyn_cast<LLVM::AtomicRMWOp>(op)) {
+      rmw.setOrdering(withAcquire(rmw.getOrdering()));
+    } else if (auto cas = dyn_cast<LLVM::AtomicCmpXchgOp>(op)) {
+      cas.setSuccessOrdering(withAcquire(cas.getSuccessOrdering()));
+      if (cas.getFailureOrdering() == LLVM::AtomicOrdering::monotonic)
+        cas.setFailureOrdering(LLVM::AtomicOrdering::acquire);
+    }
+  });
+}
+
+/// LLVM's NVPTX back end gives each `atomicrmw` the PTX default, a relaxed
+/// `atom`, whatever its order. So the order moves into fences around a relaxed
+/// one, as in the PTX memory model's mapping for C++: a release fence before it
+/// (seq_cst for a seq_cst one) and an acquire fence after it, at its scope.
+static void fenceOrderedReadModifyWrites(Operation *root) {
+  using LLVM::AtomicOrdering;
+  root->walk([&](LLVM::AtomicRMWOp rmw) {
+    AtomicOrdering o = rmw.getOrdering();
+    bool releases = o == AtomicOrdering::release ||
+                    o == AtomicOrdering::acq_rel ||
+                    o == AtomicOrdering::seq_cst;
+    bool acquires = o == AtomicOrdering::acquire ||
+                    o == AtomicOrdering::acq_rel ||
+                    o == AtomicOrdering::seq_cst;
+    if (!releases && !acquires)
+      return;
+    StringRef scope = rmw.getSyncscope().value_or(StringRef());
+    OpBuilder b(rmw);
+    if (releases)
+      b.create<LLVM::FenceOp>(rmw.getLoc(),
+                              o == AtomicOrdering::seq_cst
+                                  ? AtomicOrdering::seq_cst
+                                  : AtomicOrdering::release,
+                              scope);
+    rmw.setOrdering(AtomicOrdering::monotonic);
+    if (acquires) {
+      b.setInsertionPointAfter(rmw);
+      b.create<LLVM::FenceOp>(rmw.getLoc(), AtomicOrdering::acquire, scope);
+    }
+  });
+}
+
+/// Whether `-fweak-relaxed-atomics` was given for the module that holds `op`.
+static bool weakRelaxedAtomics(Operation *op) {
+  ModuleOp module =
+      isa<ModuleOp>(op) ? cast<ModuleOp>(op) : op->getParentOfType<ModuleOp>();
+  return module && module->hasAttr("vx.weak_relaxed_atomics");
+}
+
 /// Compile a `gpu.module` to a device image, as PTX text.
 ///
 /// This is the pipeline a standalone script established, moved into the
@@ -5134,6 +5214,9 @@ static std::string deviceImageOf(gpu::GPUModuleOp gpuModule,
     if (dynamicAlign > 16)
       g.setAlignment(dynamicAlign);
   });
+  if (!weakRelaxedAtomics(gpuModule))
+    orderRelaxedReads(*device);
+  fenceOrderedReadModifyWrites(*device);
   if (failed(toBinary.run(*device))) {
     error = "the NVPTX pipeline failed";
     return {};
@@ -5176,51 +5259,63 @@ static std::string deviceImageOf(gpu::GPUModuleOp gpuModule,
 // `VX_CTRL_LOCAL_DEVICE` in include/vx_hardware_runtime.h.
 constexpr int32_t kCtrlLocalDevice = 0x04;
 
-// Tell the backend, at the start of `main`, which local device each declared
-// GPU topology and its memory is. Their ids are hashes of their names, so the
-// backend cannot work it out from an id. The pairs (declared id, built-in id)
-// come from the front end in the `vx.local_devices` module attribute.
+// Tell the backend which local device each declared GPU topology and its
+// memory is. Their ids are hashes of their names, so the backend cannot work it
+// out from an id. The pairs (declared id, built-in id) come from the front end
+// in the `vx.local_devices` module attribute. A program tells it at the start
+// of `main`. A library has no `main`, so each `pub fn` tells it at its start,
+// and the backend keeps each pair once. Without the pairs, the backend gives
+// host memory for a GPU topology. A static constructor does not work here: the
+// object that `--action emit-obj` writes has no constructors.
 static void declareLocalDevices(ModuleOp module) {
   auto pairs = module->getAttrOfType<DenseI32ArrayAttr>("vx.local_devices");
   if (!pairs || pairs.empty())
     return;
   assert(pairs.size() % 2 == 0 && "vx.local_devices holds pairs");
-  auto main = module.lookupSymbol<func::FuncOp>("main");
-  if (!main || main.isExternal())
-    return;
+  SmallVector<func::FuncOp> entries;
+  if (auto main = module.lookupSymbol<func::FuncOp>("main"))
+    entries.push_back(main);
+  else
+    for (auto f : module.getOps<func::FuncOp>())
+      if (f->hasAttr("vx.pub"))
+        entries.push_back(f);
   MLIRContext *ctx = module.getContext();
-  OpBuilder b = OpBuilder::atBlockBegin(&main.front());
-  auto i32Type = b.getI32Type();
-  auto ptrType = LLVM::LLVMPointerType::get(ctx);
-  StringRef controlName = "vx_plugin_control";
-  // Not `main`'s location: on the AST path it carries `main`'s debug info, and
-  // LLVM refuses a declaration with that attached.
-  getOrDeclareRuntimeFn(b, module, UnknownLoc::get(ctx), controlName, i32Type,
-                        {i32Type, ptrType});
-  Location loc =
-      main.front().empty() ? main.getLoc() : main.front().front().getLoc();
+  for (func::FuncOp entry : entries) {
+    if (entry.isExternal())
+      continue;
+    OpBuilder b = OpBuilder::atBlockBegin(&entry.front());
+    auto i32Type = b.getI32Type();
+    auto ptrType = LLVM::LLVMPointerType::get(ctx);
+    StringRef controlName = "vx_plugin_control";
+    // Not the function's location: on the AST path it carries the function's
+    // debug info, and LLVM refuses a declaration with that attached.
+    getOrDeclareRuntimeFn(b, module, UnknownLoc::get(ctx), controlName, i32Type,
+                          {i32Type, ptrType});
+    Location loc =
+        entry.front().empty() ? entry.getLoc() : entry.front().front().getLoc();
 
-  Value one =
-      b.create<LLVM::ConstantOp>(loc, b.getI64Type(), b.getI64IntegerAttr(1));
-  Value pair = b.create<LLVM::AllocaOp>(
-      loc, ptrType, LLVM::LLVMArrayType::get(i32Type, 2), one);
-  Value second = b.create<LLVM::GEPOp>(loc, ptrType, i32Type, pair,
-                                       ArrayRef<LLVM::GEPArg>{1});
-  Value opcode = b.create<LLVM::ConstantOp>(
-      loc, i32Type, b.getI32IntegerAttr(kCtrlLocalDevice));
-  for (size_t i = 0; i < pairs.size(); i += 2) {
-    b.create<LLVM::StoreOp>(
-        loc,
-        b.create<LLVM::ConstantOp>(loc, i32Type, b.getI32IntegerAttr(pairs[i])),
-        pair);
-    b.create<LLVM::StoreOp>(
-        loc,
-        b.create<LLVM::ConstantOp>(loc, i32Type,
-                                   b.getI32IntegerAttr(pairs[i + 1])),
-        second);
-    b.create<LLVM::CallOp>(loc, TypeRange{i32Type},
-                           SymbolRefAttr::get(ctx, controlName),
-                           ValueRange{opcode, pair});
+    Value one =
+        b.create<LLVM::ConstantOp>(loc, b.getI64Type(), b.getI64IntegerAttr(1));
+    Value pair = b.create<LLVM::AllocaOp>(
+        loc, ptrType, LLVM::LLVMArrayType::get(i32Type, 2), one);
+    Value second = b.create<LLVM::GEPOp>(loc, ptrType, i32Type, pair,
+                                         ArrayRef<LLVM::GEPArg>{1});
+    Value opcode = b.create<LLVM::ConstantOp>(
+        loc, i32Type, b.getI32IntegerAttr(kCtrlLocalDevice));
+    for (size_t i = 0; i < pairs.size(); i += 2) {
+      b.create<LLVM::StoreOp>(loc,
+                              b.create<LLVM::ConstantOp>(
+                                  loc, i32Type, b.getI32IntegerAttr(pairs[i])),
+                              pair);
+      b.create<LLVM::StoreOp>(
+          loc,
+          b.create<LLVM::ConstantOp>(loc, i32Type,
+                                     b.getI32IntegerAttr(pairs[i + 1])),
+          second);
+      b.create<LLVM::CallOp>(loc, TypeRange{i32Type},
+                             SymbolRefAttr::get(ctx, controlName),
+                             ValueRange{opcode, pair});
+    }
   }
 }
 
@@ -6374,8 +6469,8 @@ struct LibcExternsToLLVMPass
 // `puts`, to standard output, where it mixes with what the program prints, and
 // an empty message printed a newline there. An empty message prints nothing. A
 // `cf.assert` in a `gpu.module` is left for `convert-gpu-to-nvvm`, which makes
-// it
-// `__assertfail`.
+// it `__assertfail`. The message goes through libc's `write`, so an object that
+// `--action emit-obj` builds needs no Vx runtime library for it.
 struct LowerHostAssertsPass
     : public PassWrapper<LowerHostAssertsPass, OperationPass<ModuleOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(LowerHostAssertsPass)
@@ -6405,8 +6500,17 @@ struct LowerHostAssertsPass
     }
     MLIRContext *ctx = module.getContext();
     Type ptr = LLVM::LLVMPointerType::get(ctx);
+    Type i32 = IntegerType::get(ctx, 32);
     Type i64 = IntegerType::get(ctx, 64);
     Type none = LLVM::LLVMVoidType::get(ctx);
+    // A program can define its own `write`. Then the message goes through the
+    // runtime's `vx_stderr_write`.
+    Operation *named = module.lookupSymbol("write");
+    auto declared = dyn_cast_or_null<LLVM::LLVMFuncOp>(named);
+    const bool libc =
+        !named || (declared && declared.isExternal() &&
+                   declared.getFunctionType() ==
+                       LLVM::LLVMFunctionType::get(i64, {i32, ptr, i64}));
     unsigned count = 0;
     for (cf::AssertOp op : asserts) {
       Location loc = op.getLoc();
@@ -6420,12 +6524,23 @@ struct LowerHostAssertsPass
         Value text = LLVM::createGlobalString(
             loc, b, ("__vx_assert_msg_" + llvm::Twine(count++)).str(), message,
             LLVM::Linkage::Internal);
-        auto write = LLVM::lookupOrCreateFn(b, module, "vx_stderr_write",
-                                            {ptr, i64}, i64);
-        assert(succeeded(write) && "the runtime function has one declaration");
         Value size = LLVM::ConstantOp::create(
             b, loc, i64, b.getI64IntegerAttr(message.size()));
-        LLVM::CallOp::create(b, loc, *write, ValueRange{text, size});
+        if (libc) {
+          auto write =
+              LLVM::lookupOrCreateFn(b, module, "write", {i32, ptr, i64}, i64);
+          assert(succeeded(write) && "libc's write has one declaration");
+          Value stderrFd =
+              LLVM::ConstantOp::create(b, loc, i32, b.getI32IntegerAttr(2));
+          LLVM::CallOp::create(b, loc, *write,
+                               ValueRange{stderrFd, text, size});
+        } else {
+          auto write = LLVM::lookupOrCreateFn(b, module, "vx_stderr_write",
+                                              {ptr, i64}, i64);
+          assert(succeeded(write) &&
+                 "the runtime function has one declaration");
+          LLVM::CallOp::create(b, loc, *write, ValueRange{text, size});
+        }
       }
       auto abortFn = LLVM::lookupOrCreateFn(b, module, "abort", {}, none);
       assert(succeeded(abortFn) && "C's abort has one declaration");
@@ -6446,6 +6561,27 @@ struct LowerHostAssertsPass
 // exported as `_vx_ciface_<kernel>`, so every symbol Vx exports starts with
 // `_vx_`. Functions in an `extern` block are declarations, and keep their C
 // names. A `pub fn` carries `vx.pub` and stays exported under its own name.
+// The host half of `orderRelaxedReads`. The device half runs in
+// `deviceImageOf`, which compiles each kernel to PTX before this pass.
+struct OrderRelaxedReadsPass
+    : public PassWrapper<OrderRelaxedReadsPass, OperationPass<ModuleOp>> {
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(OrderRelaxedReadsPass)
+
+  llvm::StringRef getArgument() const override {
+    return "vx-order-relaxed-reads";
+  }
+
+  llvm::StringRef getDescription() const override {
+    return "Makes each relaxed atomic read an acquire read, unless "
+           "-fweak-relaxed-atomics was given";
+  }
+
+  void runOnOperation() override {
+    if (!weakRelaxedAtomics(getOperation()))
+      orderRelaxedReads(getOperation());
+  }
+};
+
 struct HideProgramSymbolsPass
     : public PassWrapper<HideProgramSymbolsPass, OperationPass<ModuleOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(HideProgramSymbolsPass)
@@ -6571,6 +6707,9 @@ void registerVxPasses() {
   });
   mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
     return std::make_unique<HideProgramSymbolsPass>();
+  });
+  mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
+    return std::make_unique<OrderRelaxedReadsPass>();
   });
   mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
     return std::make_unique<LibcExternsToLLVMPass>();

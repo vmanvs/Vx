@@ -94,37 +94,108 @@ starts a task, and one with a `spawn` and a `join` in each pass of a loop.
 `Blocks.lean` adds `tasks { .. }`. Each `spawn` sets a register, the mark of its task. At its end,
 the block joins each task that has its mark set, so it waits only for the tasks that it started.
 `block_hb` shows that each task that a block started happens before the code after the block.
+`block_hb_nested` shows the same for a block whose code holds other blocks, when each inner block
+starts only tasks that the blocks around it do not start (`NestOk`). The inner block joined each
+of its tasks before the outer block ends.
 `BlocksExample.lean` applies `block_hb` to a run, and shows a block that starts no task and does
 not wait.
 
 `Footprint.lean` proves race freedom from a rule on the code. The code of each thread is a list
-of phases: code that starts no task, or a `tasks` block. In a block, two tasks make no accesses
-that can race, and the code of the block makes no access that can race with a task of the block.
+of phases: code that starts no task, or a `tasks` block. A block can also run again in a loop,
+with code that starts no task before and after it. Each pass joins its tasks, so the rule of one
+block holds for each pass (`Runs.loop_pass`). The code around the block can access any place
+(`block_pos`). In a block, two tasks make no accesses that can race, and the code of the block
+makes no access that can race with a task of the block. Two tasks need not be apart when one
+`spawn` of the block starts both, outside the loops of the block, and no other `spawn` starts them
+(`OneSite`). One pass of the block then starts at most one of them (`once_pass`), and the pass
+joins it before the next pass.
 The accesses of a task include the accesses of the tasks that it starts, at each depth (`Desc`).
 Code outside the blocks can access any place. `raceFree` shows that each execution of such a
 program has no data race, so `drf_sc_of_footprints` needs no hypothesis on its executions. The
 proof finds where two threads are in the tree of tasks. One thread starts the other at some depth
 (`anc`), or two tasks of one block start them (`sib`). `FootprintExample.lean` shows that the
-tasks of `forkJoin` in a block follow the rule. It also has a task that starts two tasks in its
-own block (`nestFoot`).
+tasks of `forkJoin` in a block follow the rule, also when the block runs in a loop and starts
+one task in each pass and reads the output of the task after the block (`loopFoot`). In
+`passFoot`, the two tasks of a block in a loop write one place. It also has a task that starts two tasks in its own block
+(`nestFoot`).
+The code of a block can hold other blocks, when each inner block starts only tasks that the blocks
+around it do not start (`NestOk`). The tasks of an inner block count as tasks of the outer block
+(`allIds`). So the rule compares them with the other tasks of the outer block and with all its
+code, also the code after the inner block. `desc_after` uses `block_join_nested`, so the outer
+block or the inner block joins them before the code after the outer block. In `innerFoot`, the
+code of a block starts task 0 and then starts task 1 in an inner block.
 
 `ChanFootprint.lean` gives the same rule to programs with channels and locks. The rule speaks only
 of the places of the code of the program, below `places`. `Recv.lean` shows that the places of the
 channels and the locks never race (`chan_no_race`). Their counters and flags have only `sc`
 accesses. A `recv` reads its value only after it reads the flag `full k` as set (`recv_full`), so
-the `send` happens before it (`data_hb`). The rule can also give a place a lock. The code then
-accesses the place only in `locked` blocks of that lock, and two tasks of a block can share it.
-`LockFootprint.lean` shows that each such access comes after the thread entered the lock and
-before it let the lock go (`guard_access`). So `lock_excl` orders two of them (`guard_hb`).
+the `send` happens before it (`data_hb`). The rule can also give a place a lock. The tasks and the
+blocks of the main code then access the place only in `locked` blocks of that lock, and two tasks
+of a block can share it. `LockFootprint.lean` shows that each such access comes after the thread
+entered the lock and before it let the lock go (`guard_access`, `guard_block`). So `lock_excl`
+orders two of them (`guard_hb`). The main code outside its blocks needs no lock: no task runs
+then, so the spawns and the joins order its accesses with each task (`main_task`).
 The code can also fail. Each access to the failure slot and the cancel flag is atomic
 (`fail_atomic`), so these places never race. `drf_sc_of_footprints` still needs code with no
 failures: `cancel_flag_read_before_the_failure.litmus` has a result that no interleaving gives.
-A task can also start tasks, with the same tree of tasks as in `Footprint.lean`.
+A task can also start tasks, with the same tree of tasks as in `Footprint.lean`. The code of a
+block can hold other blocks, with `NestOk` and `allIds` as in `Footprint.lean`. The lock proof
+needs no change for this: a lowered inner block only clears registers and reads the `done` flags
+(`lower_keeps`).
 `ChanFootprintExample.lean` has a block where one task sends a value to the other, a block
 where two tasks add 1 to one place under a lock, and a block where a task fails. In
-`nestChanFoot`, a task starts two tasks, and one sends a value to the other. The edges of
+`nestChanFoot`, a task starts two tasks, and one sends a value to the other. In
+`innerLockFoot`, the code of a block starts task 0, then runs an inner block of tasks 1 and 2,
+then adds 1 to a place under a lock. Task 1 sends a value to task 2, and tasks 0 and 2 write that
+place under the lock. The edges of
 channels need a finite execution whose `co` orders the writes to each place. So these theorems use `drf_sc_co`, which gives the race-freedom hypothesis
 only such executions.
+
+`Typed.lean` proves the footprint rule from types. A small typed language has locals whose types
+are trees of leaves: a number, a cell or an atomic. A cell is not `Sync`. A task captures each
+local by `move`, `ref` or `mut`. The checker gives the task and the code of its block a
+permission for each local. A local can also be a reference `&x` or `&mut x`, and a task gets a
+permission for `x` through each capture that reaches it. `&x` is `Send` only when `x` is `Sync`.
+Two permissions fit when one of them is none, or both are `ref` and the type is `Sync`. `WellTyped.footprints` shows that the compiled program follows the rule of
+`Footprint.lean`. So a well-typed program has no data race (`WellTyped.raceFree`).
+`TypedExample.lean` checks a block where two tasks add to one atomic and one task writes a
+struct. It also shows that the checker rejects a task that borrows a cell with `ref`, and a task that
+moves `&cell` into itself.
+
+A local of `Typed.lean` lives in the whole function, or only in one main phase. Two locals whose
+phases differ can share a slot, the storage of a local. The code of a phase and the tasks of a
+block use only the locals that are live there, and no reference outlives its local. The end of a
+block joins its tasks (T3), so a later phase can use the slot. In `TypedExample.lean`, two blocks
+write two locals in one slot (`scopedProg`). The checker rejects that program with no scopes. It
+also rejects code that reads through a reference after its local ended (`danglingProg`).
+
+A local of `Typed.lean` can also be a raw pointer. The checker does not know where it points, so
+an access through it needs `unsafe`. A raw pointer is not `Send` or `Sync`. Its type can opt in
+with `unsafe impl Send` or `unsafe impl Sync`. The checker cannot check these claims, so the
+theorems take them as a hypothesis (`Claims`):
+
+- Each raw pointer points to a slot.
+- A raw pointer whose type has an `unsafe impl` owns its slot. No other live local uses it.
+- For `unsafe impl Sync`, the value that the pointer points to is `Sync`.
+
+The code of a block runs while its tasks run. So it accesses only through raw pointers whose type
+has an `unsafe impl`. A task is a closure, and the rule for `spawn` is the rule for a closure, so
+closures add nothing.
+
+`TypedUnsafeExample.lean` moves a raw pointer into a task, as with a `Vec` (`bufProg`). The checker
+rejects that program if its pointer type has no `unsafe impl Send`, or if it accesses through the
+pointer outside `unsafe`. It also rejects block code that writes through a pointer with no
+`unsafe impl` while a task writes the same slot (`aliasProg`). The checker accepts a false
+`unsafe impl Sync` for a pointer to a cell (`syncCellProg`), but its claims do not hold.
+
+`TypedChan.lean` adds channels and locks, and compiles to `ChanProg`. A local can be the value
+of a mutex with a lock. An access to it needs the lock held, so the guard map of `LockFootprint.lean`
+gives its places that lock. A mutex is `Sync` when its value is `Send`, so two tasks can share a
+cell in a mutex with `ref`. `WellTyped.cfootprints` shows that the compiled program follows
+`CFootprints`, so it has no data race. `send` and `recv` use only the places of the channels.
+`TypedChanExample.lean` has two tasks that add 1 to a cell in a mutex and send a value on a
+channel. The checker rejects a write to the cell without the lock, and the same tasks with no
+mutex.
 
 ```bash
 lake -d formal/memory_model/lean build    # Lean 4.35, no other libraries
@@ -156,7 +227,8 @@ each event of the block of ticket `k` happens before each event of the block of 
 `Fifo.lean` shows that each `recv` gets the value of one `send`, in order (`ring_fifo`). The
 `recv` with the number `k` reads element `k` of the values, and only the `send` with the number
 `k` writes it. By `ring_once`, two reads of the same write belong to the same `recv`, so no value
-arrives twice.
+arrives twice. `ring_move_once` shows that each operation accesses its element once. Right after
+the access, the operation sets its flag, and its number is used only once.
 `Cancel.lean` gives a program a failure slot and a cancel flag. `fail v` writes the error `v` to
 the slot with a CAS from 0. If the CAS wrote the slot, it sets the flag with a release write.
 `checkCancel` reads the flag with acquire, and fails with `cancelled` if the flag is set.
@@ -214,8 +286,11 @@ A fork or a join is a release write and an acquire read of a flag, as in the exa
 ## Two choices in the model
 
 - **No value comes out of thin air.** The model keeps the rule of RC11: no cycle of program order
-  and reads, also for relaxed atomics. AArch64 allows such a cycle, so a relaxed load needs a
-  dependency on AArch64, as RC11 says. The other choice would leave the problem open, as in C++.
+  and reads, also for relaxed atomics. PTX and AArch64 allow such a cycle, so vxc makes each
+  relaxed atomic read an acquire read (`vx-order-relaxed-reads`). The other choice would leave the
+  problem open, as in C++. `-fweak-relaxed-atomics` keeps relaxed reads relaxed. A program
+  compiled with it follows this model without the rule, and can show
+  `load_buffering_relaxed.litmus`.
 - **Two atomics race unless each one reaches the thread of the other.** This follows the PTX
   model. `atomic_of_block_scope_across_blocks.litmus` shows the case.
 
@@ -227,8 +302,8 @@ A fork or a join is a release write and an acquire read of a flag, as in the exa
 - herd7 checks each test completely, but only the tests. memalloy checks every execution up to 5
   or 6 events.
 - The core language has no functions and no references.
-- `block_hb` needs a block whose body holds no other `tasks` block. A task can hold its own
-  blocks.
+- The rules compare each task of an inner block with all the code of the outer block, also the
+  code after the inner block joined it.
 - The Lean model has no scopes and no barriers.
 - The model covers only C0 to C7. The rules for sequential code, E1 to E7 and A1 to A6, are not in
   it.
@@ -253,11 +328,10 @@ A fork or a join is a release write and an acquire read of a flag, as in the exa
   the flag.
 - `each_error_once` follows an error by the CAS of its failure, not by a value with an owner. A
   CAS that loses still reads the error that won, but only to see that the slot is set.
-- The code accesses a place that a lock guards only under that lock, even outside the blocks of
-  tasks. In both rules, a block cannot
-  be in a loop. The rule is stricter than needed: two blocks that run one after the other can
-  share places, but two tasks of one block cannot.
+- A task accesses a place that a lock guards only under that lock, even outside its own blocks,
+  because its sibling tasks can run then. Only the main code outside its blocks needs no lock.
+- In `Footprint.lean`, the body of a loop is one block with code around it. In
+  `ChanFootprint.lean`, it is only the block. Two tasks of one block must be apart, unless one
+  `spawn` starts both (`OneSite`). The rule is stricter than needed: two blocks that run one after
+  the other can share places, but two tasks from two `spawn`s of one block cannot.
 - In both rules, one thread starts each task, and a task starts only tasks with larger ids.
-- `ring_fifo` speaks of each read of the values. A `recv` reads its element once, and a `send`
-  writes its element once. This follows from their code, but no theorem states it yet.
-  `recv_full` shows that a `recv` reads its element only after it reads `full k` as set.

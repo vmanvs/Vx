@@ -87,12 +87,32 @@ impl std::error::Error for ModuleEmitError {}
 /// The MLIR type string for a scalar element type. Integers are signless (signedness lives in the
 /// op, e.g. `divsi`/`divui`); `bool` is `i1`.
 /// Format a float so MLIR can parse it back: Rust's `{:?}` prints `0.00001` as `1e-5`,
-/// and MLIR needs a decimal point before the exponent (Vx#384).
-fn mlir_float_literal(value: f64) -> String {
+/// and MLIR needs a decimal point before the exponent (Vx#384). A non-finite value is written
+/// as its bit pattern in hex at `bits` width — MLIR does not accept `inf` / `-inf` / `NaN`
+/// as float attribute text (Vx#2081).
+fn mlir_float_literal(value: f64, elem: &ElementType) -> String {
+    if !value.is_finite() {
+        // Bit patterns differ by type. f16 and bf16 are both 16 bits, but infinity and NaN
+        // use different encodings, so the element type is required (not only the width).
+        return match elem {
+            ElementType::F16 => {
+                let sign = ((value.to_bits() >> 63) as u16) << 15;
+                let mag = if value.is_nan() { 0x7E00u16 } else { 0x7C00u16 };
+                format!("0x{:04X}", sign | mag)
+            }
+            ElementType::BF16 => {
+                let sign = ((value.to_bits() >> 63) as u16) << 15;
+                let mag = if value.is_nan() { 0x7FC0u16 } else { 0x7F80u16 };
+                format!("0x{:04X}", sign | mag)
+            }
+            ElementType::F32 => format!("0x{:08X}", (value as f32).to_bits()),
+            ElementType::F64 => format!("0x{:016X}", value.to_bits()),
+            other => panic!("mlir_float_literal: non-finite float for unexpected type {other:?}"),
+        };
+    }
     let text = format!("{value:?}");
     match text.split_once(['e', 'E']) {
-        // `1e-5` -> `1.0e-5`. A mantissa that already has a point, and anything without an
-        // exponent at all (`288.0`, `inf`, `NaN`), is left exactly as Rust printed it.
+        // `1e-5` -> `1.0e-5`. A mantissa that already has a point is left as Rust printed it.
         Some((mantissa, exponent)) if !mantissa.contains('.') => format!("{mantissa}.0e{exponent}"),
         _ => text,
     }
@@ -2516,7 +2536,7 @@ pub fn emit_function_mlir(
         Type::Scalar(_) => {
             return Err(Decline::TypeNotModelled {
                 what: "a generic scalar return type",
-            })
+            });
         }
         _ => None, // non-scalar: a struct return is handled below; anything else is void
     };
@@ -3369,7 +3389,10 @@ mod tests {
              fn make(tensor: &Tensor<f32,[4]>) -> i32 { \
                let holder = Holder<i32> { value: 5, tensor: tensor, tail: 41 }; return holder.value; }",
             |layouts| {
-                let layout = layouts.iter_mut().find(|layout| layout.name == "Holder").expect("Holder layout");
+                let layout = layouts
+                    .iter_mut()
+                    .find(|layout| layout.name == "Holder")
+                    .expect("Holder layout");
                 // Reproduce the former descriptor-as-pointer record while keeping its registry ID.
                 layout.size_bytes = 24;
                 layout.fields[1].layout.size = 8;
@@ -3397,9 +3420,7 @@ mod tests {
                     .find(|l| l.name == "Holder")
                     .expect("Holder layout");
                 let emitter = AggLayout::from_generated(layout);
-                let item = layout.fields[0]
-                    .aggregate_id
-                    .expect("Item aggregate ID");
+                let item = layout.fields[0].aggregate_id.expect("Item aggregate ID");
                 assert_eq!(
                     emitter.field_agg[0],
                     Some(item),
@@ -4032,17 +4053,54 @@ mod tests {
     #[test]
     fn float_literals_keep_a_decimal_point_before_the_exponent() {
         // The exact case that broke `struct_codegen.vx`.
-        assert_eq!(super::mlir_float_literal(1e-5), "1.0e-5");
+        assert_eq!(
+            super::mlir_float_literal(1e-5, &crate::syntax::ElementType::F64),
+            "1.0e-5"
+        );
 
         // The property, over a spread of magnitudes: whatever Rust chooses to print, the
         // mantissa always carries a point.
         for value in [1e-5, 1e-7, 2.5e-9, 288.0, 0.5, -0.25, 1.0, 3.4e38] {
-            let text = super::mlir_float_literal(value);
+            let text = super::mlir_float_literal(value, &crate::syntax::ElementType::F64);
             let mantissa = text.split(['e', 'E']).next().unwrap();
             assert!(
                 mantissa.contains('.'),
                 "{value} formatted as {text}, whose mantissa has no decimal point"
             );
         }
+    }
+
+    /// MLIR rejects `inf` / `-inf` / `NaN` as float attribute text. Non-finite constants must
+    /// be the bit pattern in hex, at the width of the type (Vx#2081).
+    #[test]
+    fn float_literals_write_non_finite_as_hex_bits() {
+        use crate::syntax::ElementType::{BF16, F16, F32, F64};
+        assert_eq!(
+            super::mlir_float_literal(f64::INFINITY, &F64),
+            "0x7FF0000000000000"
+        );
+        assert_eq!(
+            super::mlir_float_literal(f64::NEG_INFINITY, &F64),
+            "0xFFF0000000000000"
+        );
+        assert_eq!(
+            super::mlir_float_literal(f64::NAN, &F64),
+            "0x7FF8000000000000"
+        );
+        assert_eq!(super::mlir_float_literal(f64::INFINITY, &F32), "0x7F800000");
+        assert_eq!(
+            super::mlir_float_literal(f64::NEG_INFINITY, &F32),
+            "0xFF800000"
+        );
+        assert_eq!(super::mlir_float_literal(f64::NAN, &F32), "0x7FC00000");
+        assert_eq!(super::mlir_float_literal(f64::INFINITY, &F16), "0x7C00");
+        assert_eq!(super::mlir_float_literal(f64::NEG_INFINITY, &F16), "0xFC00");
+        assert_eq!(super::mlir_float_literal(f64::NAN, &F16), "0x7E00");
+        assert_eq!(super::mlir_float_literal(f64::INFINITY, &BF16), "0x7F80");
+        assert_eq!(
+            super::mlir_float_literal(f64::NEG_INFINITY, &BF16),
+            "0xFF80"
+        );
+        assert_eq!(super::mlir_float_literal(f64::NAN, &BF16), "0x7FC0");
     }
 }
