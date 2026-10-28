@@ -34,6 +34,14 @@ jobs:
             -Wl,-rpath,/usr/local/cuda/lib64 -lcudart -lcublas -ldl
           ls -l /tmp/libvx_cuda_dispatch.so
 
+      - name: Build and run the remote client test as the Rust driver does
+        run: |
+          set -euo pipefail
+          g++ -std=c++17 -O1 -Wall -Werror \
+            tests/runtime/remote_kernel_output_test.cpp \
+            -o /tmp/remote_kernel_output_test
+          /tmp/remote_kernel_output_test
+
       - name: Show warnings with -Wall (does not fail the job)
         continue-on-error: true
         run: |
