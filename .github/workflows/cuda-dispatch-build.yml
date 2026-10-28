@@ -26,7 +26,9 @@ jobs:
       - name: Build cuda_dispatch.cpp as build.rs does
         run: |
           set -euo pipefail
-          clang++ -shared -fPIC runtime/cuda_dispatch.cpp -lffi \
+          # The release job's LLVM 22 clang++ defaults to C++17. This runner's
+          # clang 14 defaults to C++14, so say it.
+          clang++ -std=c++17 -shared -fPIC runtime/cuda_dispatch.cpp -lffi \
             -o /tmp/libvx_cuda_dispatch.so -O3 \
             -I/usr/local/cuda/include -L/usr/local/cuda/lib64 \
             -Wl,-rpath,/usr/local/cuda/lib64 -lcudart -lcublas -ldl
@@ -35,5 +37,5 @@ jobs:
       - name: Show warnings with -Wall (does not fail the job)
         continue-on-error: true
         run: |
-          clang++ -fsyntax-only -Wall -Wextra runtime/cuda_dispatch.cpp \
+          clang++ -std=c++17 -fsyntax-only -Wall -Wextra runtime/cuda_dispatch.cpp \
             -I/usr/local/cuda/include
