@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>  /* vx_memref_view_bytes: fprintf */
 #include <stdlib.h> /* vx_payload_topology: strtol */
 #include <string.h> /* vx_payload_field: strlen, memcmp, memchr */
 
@@ -197,6 +198,51 @@ static inline int64_t vx_memref_offset(const void *desc) {
 static inline void *vx_memref_data(const void *desc, int32_t dtype) {
   return (char *)vx_memref_aligned(desc) +
          vx_memref_offset(desc) * (int64_t)vx_dtype_bytes(dtype);
+}
+
+/// The bytes from a view's first element to one past the last element it can
+/// reach: `(1 + sum((sizes[d] - 1) * strides[d])) * element size`. Returns 0
+/// for an empty view.
+///
+/// Use this to copy a view, not `sizes[0] * strides[0]`. That product is
+/// correct only for a dense row-major view. A transposed view reaches more
+/// elements, and a view with padded rows reaches fewer.
+///
+/// Stops the program for a negative stride or a span that does not fit in 64
+/// bits. The compiler makes neither, so the descriptor is broken.
+static inline uint64_t vx_memref_view_bytes(const int64_t *sizes,
+                                            const int64_t *strides,
+                                            int32_t rank, int32_t elem) {
+  uint64_t last = 0; /* the index of the last element the view reaches */
+  uint64_t count, bytes;
+  for (int32_t d = 0; d < rank; ++d) {
+    if (sizes[d] <= 0) {
+      return 0;
+    }
+  }
+  for (int32_t d = 0; d < rank; ++d) {
+    uint64_t step;
+    if (strides[d] < 0) {
+      fprintf(stderr,
+              "[Vx] FATAL: dimension %d of a tensor view has the negative "
+              "stride %lld\n",
+              d, (long long)strides[d]);
+      abort();
+    }
+    if (__builtin_mul_overflow((uint64_t)(sizes[d] - 1), (uint64_t)strides[d],
+                               &step) ||
+        __builtin_add_overflow(last, step, &last)) {
+      fprintf(stderr, "[Vx] FATAL: a tensor view spans more than 2^64 "
+                      "elements\n");
+      abort();
+    }
+  }
+  if (__builtin_add_overflow(last, (uint64_t)1, &count) ||
+      __builtin_mul_overflow(count, (uint64_t)vx_dtype_bytes(elem), &bytes)) {
+    fprintf(stderr, "[Vx] FATAL: a tensor view spans more than 2^64 bytes\n");
+    abort();
+  }
+  return bytes;
 }
 
 /// Write a contiguous row-major descriptor for `data` into `desc`.

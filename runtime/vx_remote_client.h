@@ -262,11 +262,16 @@ static inline int vx_remote_encode_args(int fd, void **device_args,
         const int64_t *strides = vx_memref_strides(inner, rank);
         uint64_t handle = (uint64_t)(uintptr_t)vx_memref_data(inner, elem);
         if (!vx_remote_addr_is_handle(handle)) {
-          uint64_t span =
-              rank > 0 ? (uint64_t)sizes[0] * (uint64_t)strides[0] : 1;
+          uint64_t bytes = vx_memref_view_bytes(sizes, strides, rank, elem);
+          if (bytes == 0) {
+            fprintf(stderr,
+                    "[Vx remote] cannot stage argument %lld: a worker "
+                    "cannot hold an empty tensor\n",
+                    (long long)i);
+            return 0;
+          }
           handle = vx_remote_transfer(fd, (const void *)(uintptr_t)handle,
-                                      span * (uint64_t)vx_dtype_bytes(elem),
-                                      elem, scratch, scratch_len);
+                                      bytes, elem, scratch, scratch_len);
           if (handle == 0) {
             return 0;
           }
@@ -306,12 +311,17 @@ static inline int vx_remote_encode_args(int fd, void **device_args,
       handle = (uint64_t)(uintptr_t)vx_memref_data(desc, elem);
 
       if (!vx_remote_addr_is_handle(handle)) {
-        /* Local memory. Stage the whole extent the descriptor spans, so a
-           strided view arrives with the rows it refers to rather than only the
-           elements it touches, and its strides still mean what they said. */
-        uint64_t span =
-            rank > 0 ? (uint64_t)sizes[0] * (uint64_t)strides[0] : 1;
-        uint64_t bytes = span * (uint64_t)vx_dtype_bytes(elem);
+        /* Local memory. Stage every element from the first one the view
+           reaches to the last one, so its strides still mean what they said
+           on the worker. */
+        uint64_t bytes = vx_memref_view_bytes(sizes, strides, rank, elem);
+        if (bytes == 0) {
+          fprintf(stderr,
+                  "[Vx remote] cannot stage argument %lld: a worker cannot "
+                  "hold an empty tensor\n",
+                  (long long)i);
+          return 0;
+        }
         handle = vx_remote_transfer(fd, (const void *)(uintptr_t)handle, bytes,
                                     elem, scratch, scratch_len);
         if (handle == 0) {
@@ -332,7 +342,7 @@ static inline int vx_remote_encode_args(int fd, void **device_args,
 }
 
 /// Copy argument `i` back from the worker copy `handle` into the host buffer
-/// that vx_remote_encode_args staged it from. Uses the same span as staging.
+/// that vx_remote_encode_args staged it from. Copies the same bytes as staging.
 static inline int vx_remote_fetch_staged(int fd, void **device_args,
                                          const int32_t *arg_tags, int64_t i,
                                          uint64_t handle) {
@@ -344,9 +354,9 @@ static inline int vx_remote_fetch_staged(int fd, void **device_args,
   int32_t rank = (int32_t)VX_ABI_RANK(arg_tags[i]);
   const int64_t *sizes = vx_memref_sizes(desc);
   const int64_t *strides = vx_memref_strides(desc, rank);
-  uint64_t span = rank > 0 ? (uint64_t)sizes[0] * (uint64_t)strides[0] : 1;
-  uint64_t bytes = span * (uint64_t)vx_dtype_bytes(elem);
-  return vx_remote_fetch(fd, handle, vx_memref_data(desc, elem), bytes);
+  uint64_t bytes = vx_memref_view_bytes(sizes, strides, rank, elem);
+  return bytes != 0 &&
+         vx_remote_fetch(fd, handle, vx_memref_data(desc, elem), bytes);
 }
 
 static inline int vx_remote_was_staged(const uint64_t *staged,

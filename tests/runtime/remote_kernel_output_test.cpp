@@ -1,5 +1,4 @@
-//===- remote_kernel_output_test.cpp - A worker's writes reach the host -*- C++
-//-*-===//
+//===- remote_kernel_output_test.cpp - Remote copies ------------*- C++ -*-===//
 //
 // Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
 // See LICENSE for license information.
@@ -11,7 +10,7 @@
 // copies each buffer to the worker, the worker runs the kernel on the copies,
 // and the client must copy the written values back into the host buffers.
 //
-// Three dispatches, over one socket to a fake worker in a child process:
+// These dispatches go over one socket to a fake worker in a child process:
 //
 //   * A kernel the compiler generated (the payload carries `image=`) writes two
 //     host buffers. Both must hold the kernel's values afterwards.
@@ -20,9 +19,20 @@
 //   * The same kernel, with one output already on the worker. That output must
 //     stay on the worker, and the other output must still reach the host.
 //   * A matmul with `outkind=buffer`, which fills one host buffer.
+//   * A view with an empty dimension. The client must refuse it, because a
+//     worker cannot hold an empty tensor.
+//   * A 3x4 transposed view. The client must copy all 12 elements it reaches.
+//   * A 2x2 view with padded rows. The client must copy only the elements from
+//     the view's first element to its last, in both directions. The view ends
+//     at a page that cannot be read, so a longer copy crashes the test.
+//
+// Two more cases call vx_memref_view_bytes directly in a child process. A view
+// with a negative stride, and a view whose span does not fit in 64 bits, must
+// stop the program.
 //
 // The fake worker does not load the image. It runs a fixed function in its
-// place: out1[i] = 2 * in[i] and out2[i] = in[i] + 100.
+// place: out1[i] = 2 * in[i] and out2[i] = in[i] + 100. For the views it
+// doubles each element of the view.
 //
 // Driven by tests/integration_test/remote_kernel_output_test.rs.
 //
@@ -31,9 +41,11 @@
 #include "../../runtime/vx_remote_client.h"
 #include "test_worker.h"
 
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -83,6 +95,36 @@ int run_fake_kernel(const vx_wire_arg *args, int64_t num_args) {
   return 1;
 }
 
+// The stand-in for a kernel on one rank-2 f32 view. It doubles each element.
+// It fails when the client staged more or fewer bytes than the view reaches.
+int run_view_kernel(const vx_wire_arg *args, int64_t num_args) {
+  if (num_args != 1 || args[0].rank != 2) {
+    return 0;
+  }
+  const int64_t *sizes = args[0].sizes;
+  const int64_t *strides = args[0].strides;
+  if (sizes[0] == 0 || sizes[1] == 0) {
+    return 1; // nothing to double
+  }
+  vx_remote_ref ref;
+  if (!vx_remote_resolve(&worker_table, args[0].handle, &ref)) {
+    return 0;
+  }
+  uint64_t reach = (uint64_t)((sizes[0] - 1) * strides[0] +
+                              (sizes[1] - 1) * strides[1] + 1) *
+                   sizeof(float);
+  if (ref.region->size - ref.offset != reach) {
+    return 0;
+  }
+  float *view = (float *)((char *)ref.region->remote + ref.offset);
+  for (int64_t i = 0; i < sizes[0]; ++i) {
+    for (int64_t j = 0; j < sizes[1]; ++j) {
+      view[i * strides[0] + j * strides[1]] *= 2;
+    }
+  }
+  return 1;
+}
+
 void run_worker(int fd) {
   worker_reset();
 
@@ -120,7 +162,10 @@ void run_worker(int fd) {
         ok = vx_wire_get_arg(&r, &args[i]);
       }
       if (ok) {
-        if (vx_payload_field(d.payload, (size_t)d.payload_len, "image=")) {
+        if (strcmp((const char *)d.payload, "vx_gpu_kernel_view") == 0) {
+          ok = run_view_kernel(args, d.num_args);
+        } else if (vx_payload_field(d.payload, (size_t)d.payload_len,
+                                    "image=")) {
           ok = run_fake_kernel(args, d.num_args);
         } else {
           ok = worker_dispatch(&d, args, results, &num_results);
@@ -295,6 +340,121 @@ void test_a_matmul_fills_a_host_buffer(int fd) {
   }
 }
 
+const char kViewPayload[] = "vx_gpu_kernel_view\0abi=1\0topo=500\0"
+                            "format=ptx\0image=not-real-ptx\0";
+
+// Dispatch the view kernel on one rank-2 view over `data`.
+int dispatch_view(int fd, float *data, int64_t offset, int64_t rows,
+                  int64_t cols, int64_t row_stride, int64_t col_stride = 1) {
+  Desc2 d = {data, data, offset, {rows, cols}, {row_stride, col_stride}};
+  void *p = &d;
+  void *device_args[1] = {&p};
+  const int32_t tags[1] = {VX_ABI_MEMREF_TAG(VX_DTYPE_F32, 2)};
+  vx_wire_arg args[1];
+  return vx_remote_dispatch(fd, kViewPayload, sizeof(kViewPayload), device_args,
+                            tags, 1, args, host_scratch, sizeof(host_scratch));
+}
+
+void test_an_empty_view_is_refused(int fd) {
+  float data[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+  check(dispatch_view(fd, data, 0, 2, 0, 4) == 0,
+        "a 2x0 view is refused before it is staged");
+  // A dimension with stride 0 repeats one element, as a broadcast does. When
+  // its size is 0 the view is still empty.
+  check(dispatch_view(fd, data, 0, 2, 0, 4, 0) == 0,
+        "a 2x0 view whose empty dimension has stride 0 is refused");
+}
+
+void test_a_transposed_view_copies_all_it_reaches(int fd) {
+  // A 3x4 view with strides (1, 3) reaches all 12 elements. Element (i, j) is
+  // data[i + 3 * j]. sizes[0] * strides[0] is only 3.
+  float data[12];
+  for (int i = 0; i < 12; ++i) {
+    data[i] = (float)i;
+  }
+  check(dispatch_view(fd, data, 0, 3, 4, 1, 3) == 1,
+        "the transposed view's dispatch succeeds");
+  for (int i = 0; i < 12; ++i) {
+    char what[64];
+    snprintf(what, sizeof(what), "element %d == %d", i, 2 * i);
+    check(data[i] == (float)(2 * i), what);
+  }
+}
+
+// Calls vx_memref_view_bytes on a rank-1 f32 view in a child process. Returns
+// true when the child stopped with abort() and printed `message`.
+bool view_bytes_stops_with(int64_t size, int64_t stride, const char *message) {
+  int pipe_fds[2];
+  if (pipe(pipe_fds) != 0) {
+    return false;
+  }
+  pid_t pid = fork();
+  if (pid < 0) {
+    return false;
+  }
+  if (pid == 0) {
+    dup2(pipe_fds[1], STDERR_FILENO);
+    vx_memref_view_bytes(&size, &stride, 1, VX_DTYPE_F32);
+    _exit(0);
+  }
+  close(pipe_fds[1]);
+  char out[256] = {0};
+  size_t got = 0;
+  ssize_t n;
+  while (got < sizeof(out) - 1 &&
+         (n = read(pipe_fds[0], out + got, sizeof(out) - 1 - got)) > 0) {
+    got += (size_t)n;
+  }
+  close(pipe_fds[0]);
+  int status = 0;
+  waitpid(pid, &status, 0);
+  return WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT &&
+         strstr(out, message) != nullptr;
+}
+
+void test_a_negative_stride_stops_the_program() {
+  check(view_bytes_stops_with(4, -1, "has the negative stride -1"),
+        "a view with a negative stride stops the program");
+}
+
+void test_a_view_whose_span_overflows_stops_the_program() {
+  // The last element is at index 2^62 * 4 = 2^64, which does not fit.
+  check(view_bytes_stops_with(((int64_t)1 << 62) + 1, 4,
+                              "spans more than 2^64 elements"),
+        "a view that reaches past element 2^64 stops the program");
+  // The last element is at index 2^62, and 2^62 + 1 f32 values need more than
+  // 2^64 bytes.
+  check(view_bytes_stops_with(((int64_t)1 << 62) + 1, 1,
+                              "spans more than 2^64 bytes"),
+        "a view of more than 2^64 bytes stops the program");
+}
+
+void test_a_padded_view_copies_only_what_it_reaches(int fd) {
+  // Seven elements that end where an unreadable page starts. The view starts
+  // at element 1, has two rows of two, and its rows are 4 elements apart. It
+  // reaches elements 1, 2, 5 and 6, so the copy is elements 1 to 6.
+  long page = sysconf(_SC_PAGESIZE);
+  char *pages = (char *)mmap(nullptr, 2 * page, PROT_READ | PROT_WRITE,
+                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (pages == MAP_FAILED || mprotect(pages + page, page, PROT_NONE) != 0) {
+    check(false, "the guard page was set up");
+    return;
+  }
+  float *data = (float *)(pages + page) - 7;
+  const float before[7] = {10, 11, 12, 13, 14, 15, 16};
+  const float after[7] = {10, 22, 24, 13, 14, 30, 32};
+  memcpy(data, before, sizeof(before));
+
+  check(dispatch_view(fd, data, 1, 2, 2, 4) == 1,
+        "the padded view's dispatch succeeds");
+  for (int i = 0; i < 7; ++i) {
+    char what[64];
+    snprintf(what, sizeof(what), "element %d == %g", i, (double)after[i]);
+    check(data[i] == after[i], what);
+  }
+  munmap(pages, 2 * page);
+}
+
 } // namespace
 
 int main() {
@@ -317,6 +477,12 @@ int main() {
   test_a_generated_kernel_writes_both_host_outputs(sv[0]);
   test_an_output_on_the_worker_stays_there(sv[0]);
   test_a_matmul_fills_a_host_buffer(sv[0]);
+  test_an_empty_view_is_refused(sv[0]);
+  test_a_transposed_view_copies_all_it_reaches(sv[0]);
+  test_a_negative_stride_stops_the_program();
+  test_a_view_whose_span_overflows_stops_the_program();
+  // Last, because the code before the fix crashes on it.
+  test_a_padded_view_copies_only_what_it_reaches(sv[0]);
 
   close(sv[0]);
   int status = 0;

@@ -1404,9 +1404,11 @@ uint64_t vx_plugin_dispatch_async(const void *binary_payload,
     const int32_t rank = (int32_t)VX_ABI_RANK(arg_tags[i]);
     const int64_t *sizes = vx_memref_sizes(desc);
     const int64_t *strides = vx_memref_strides(desc, rank);
-    const int64_t span = rank > 0 ? sizes[0] * strides[0] : 1;
-    const size_t bytes = (size_t)(vx_memref_offset(desc) + span) *
-                         vx_dtype_bytes((int32_t)VX_ABI_ELEM(arg_tags[i]));
+    const int32_t elem = (int32_t)VX_ABI_ELEM(arg_tags[i]);
+    const uint64_t view = vx_memref_view_bytes(sizes, strides, rank, elem);
+    /* Copy from the base, not the first element, so the offset still holds. */
+    const size_t bytes =
+        view ? (size_t)vx_memref_offset(desc) * vx_dtype_bytes(elem) + view : 0;
     void *host = malloc(bytes ? bytes : 1);
     if (!host) {
       fprintf(stderr,
