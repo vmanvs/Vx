@@ -1,0 +1,39 @@
+name: Throwaway - build cuda_dispatch.cpp
+
+# Builds only runtime/cuda_dispatch.cpp against the CUDA toolkit, with the
+# command build.rs uses. No GPU, no LLVM, no cargo.
+on:
+  push:
+    branches: [ 'ci/cuda-dispatch-view-bytes' ]
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the CUDA toolkit and libffi
+        run: |
+          set -euo pipefail
+          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libffi-dev \
+            cuda-cudart-dev-12-6 libcublas-dev-12-6 cuda-driver-dev-12-6 cuda-nvcc-12-6
+          test -f /usr/local/cuda/include/cuda_runtime.h || sudo ln -sfn /usr/local/cuda-12.6 /usr/local/cuda
+          ls -l /usr/local/cuda/include/cuda_runtime.h /usr/local/cuda/include/crt/host_defines.h
+
+      - name: Build cuda_dispatch.cpp as build.rs does
+        run: |
+          set -euo pipefail
+          clang++ -shared -fPIC runtime/cuda_dispatch.cpp -lffi \
+            -o /tmp/libvx_cuda_dispatch.so -O3 \
+            -I/usr/local/cuda/include -L/usr/local/cuda/lib64 \
+            -Wl,-rpath,/usr/local/cuda/lib64 -lcudart -lcublas -ldl
+          ls -l /tmp/libvx_cuda_dispatch.so
+
+      - name: Show warnings with -Wall (does not fail the job)
+        continue-on-error: true
+        run: |
+          clang++ -fsyntax-only -Wall -Wextra runtime/cuda_dispatch.cpp \
+            -I/usr/local/cuda/include
