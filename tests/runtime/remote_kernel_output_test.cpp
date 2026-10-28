@@ -19,16 +19,17 @@
 //   * The same kernel, with one output already on the worker. That output must
 //     stay on the worker, and the other output must still reach the host.
 //   * A matmul with `outkind=buffer`, which fills one host buffer.
-//   * A view with an empty dimension. The client must refuse it, because a
-//     worker cannot hold an empty tensor.
+//   * A view with an empty dimension. A worker cannot hold 0 bytes, so the
+//     client must stage exactly one element and must not copy anything back.
 //   * A 3x4 transposed view. The client must copy all 12 elements it reaches.
+//     The same view inside a slot must also copy all 12.
 //   * A 2x2 view with padded rows. The client must copy only the elements from
 //     the view's first element to its last, in both directions. The view ends
 //     at a page that cannot be read, so a longer copy crashes the test.
 //
-// Two more cases call vx_memref_view_bytes directly in a child process. A view
-// with a negative stride, and a view whose span does not fit in 64 bits, must
-// stop the program.
+// More cases call vx_memref_view_bytes directly in a child process. A view
+// with an element type that has no size, a negative size, a negative stride,
+// or a span that does not fit in 64 bits must stop the program.
 //
 // The fake worker does not load the image. It runs a fixed function in its
 // place: out1[i] = 2 * in[i] and out2[i] = in[i] + 100. For the views it
@@ -96,19 +97,20 @@ int run_fake_kernel(const vx_wire_arg *args, int64_t num_args) {
 }
 
 // The stand-in for a kernel on one rank-2 f32 view. It doubles each element.
-// It fails when the client staged more or fewer bytes than the view reaches.
+// It fails when the client staged more or fewer bytes than the view reaches,
+// or for an empty view, more or fewer than one element.
 int run_view_kernel(const vx_wire_arg *args, int64_t num_args) {
   if (num_args != 1 || args[0].rank != 2) {
     return 0;
   }
   const int64_t *sizes = args[0].sizes;
   const int64_t *strides = args[0].strides;
-  if (sizes[0] == 0 || sizes[1] == 0) {
-    return 1; // nothing to double
-  }
   vx_remote_ref ref;
   if (!vx_remote_resolve(&worker_table, args[0].handle, &ref)) {
     return 0;
+  }
+  if (sizes[0] == 0 || sizes[1] == 0) {
+    return ref.region->size - ref.offset == sizeof(float); // nothing to double
   }
   uint64_t reach = (uint64_t)((sizes[0] - 1) * strides[0] +
                               (sizes[1] - 1) * strides[1] + 1) *
@@ -343,47 +345,68 @@ void test_a_matmul_fills_a_host_buffer(int fd) {
 const char kViewPayload[] = "vx_gpu_kernel_view\0abi=1\0topo=500\0"
                             "format=ptx\0image=not-real-ptx\0";
 
-// Dispatch the view kernel on one rank-2 view over `data`.
+// Dispatch the view kernel on one rank-2 view over `data`. With `in_slot`, the
+// argument is a slot that holds the view, as generated code passes a local
+// tensor.
 int dispatch_view(int fd, float *data, int64_t offset, int64_t rows,
-                  int64_t cols, int64_t row_stride, int64_t col_stride = 1) {
+                  int64_t cols, int64_t row_stride, int64_t col_stride = 1,
+                  bool in_slot = false) {
   Desc2 d = {data, data, offset, {rows, cols}, {row_stride, col_stride}};
-  void *p = &d;
+  Desc1 slot = {&d, &d, 0, {1}, {1}};
+  void *p = in_slot ? (void *)&slot : (void *)&d;
   void *device_args[1] = {&p};
-  const int32_t tags[1] = {VX_ABI_MEMREF_TAG(VX_DTYPE_F32, 2)};
+  const int32_t tags[1] = {in_slot ? VX_ABI_SLOT_TAG(VX_DTYPE_F32, 2)
+                                   : VX_ABI_MEMREF_TAG(VX_DTYPE_F32, 2)};
   vx_wire_arg args[1];
   return vx_remote_dispatch(fd, kViewPayload, sizeof(kViewPayload), device_args,
                             tags, 1, args, host_scratch, sizeof(host_scratch));
 }
 
-void test_an_empty_view_is_refused(int fd) {
+void test_an_empty_view_stages_one_element(int fd) {
   float data[8] = {1, 2, 3, 4, 5, 6, 7, 8};
-  check(dispatch_view(fd, data, 0, 2, 0, 4) == 0,
-        "a 2x0 view is refused before it is staged");
+  check(dispatch_view(fd, data, 0, 2, 0, 4) == 1,
+        "the 2x0 view's dispatch succeeds");
   // A dimension with stride 0 repeats one element, as a broadcast does. When
   // its size is 0 the view is still empty.
-  check(dispatch_view(fd, data, 0, 2, 0, 4, 0) == 0,
-        "a 2x0 view whose empty dimension has stride 0 is refused");
+  check(dispatch_view(fd, data, 0, 2, 0, 4, 0) == 1,
+        "the dispatch of a 2x0 view whose empty dimension has stride 0 "
+        "succeeds");
+  for (int i = 0; i < 8; ++i) {
+    char what[64];
+    snprintf(what, sizeof(what), "element %d under the empty views == %d", i,
+             i + 1);
+    check(data[i] == (float)(i + 1), what);
+  }
 }
 
-void test_a_transposed_view_copies_all_it_reaches(int fd) {
+void check_transposed_view(int fd, bool in_slot) {
   // A 3x4 view with strides (1, 3) reaches all 12 elements. Element (i, j) is
   // data[i + 3 * j]. sizes[0] * strides[0] is only 3.
+  const char *where = in_slot ? "in a slot" : "as a tensor";
   float data[12];
   for (int i = 0; i < 12; ++i) {
     data[i] = (float)i;
   }
-  check(dispatch_view(fd, data, 0, 3, 4, 1, 3) == 1,
-        "the transposed view's dispatch succeeds");
+  char what[96];
+  snprintf(what, sizeof(what),
+           "the dispatch of the transposed view %s succeeds", where);
+  check(dispatch_view(fd, data, 0, 3, 4, 1, 3, in_slot) == 1, what);
   for (int i = 0; i < 12; ++i) {
-    char what[64];
-    snprintf(what, sizeof(what), "element %d == %d", i, 2 * i);
+    snprintf(what, sizeof(what), "transposed view %s: element %d == %d", where,
+             i, 2 * i);
     check(data[i] == (float)(2 * i), what);
   }
 }
 
-// Calls vx_memref_view_bytes on a rank-1 f32 view in a child process. Returns
-// true when the child stopped with abort() and printed `message`.
-bool view_bytes_stops_with(int64_t size, int64_t stride, const char *message) {
+void test_a_transposed_view_copies_all_it_reaches(int fd) {
+  check_transposed_view(fd, false);
+  check_transposed_view(fd, true);
+}
+
+// Calls vx_memref_view_bytes on a rank-1 view in a child process. Returns true
+// when the child stopped with abort() and printed `message`.
+bool view_bytes_stops_with(int64_t size, int64_t stride, const char *message,
+                           int32_t elem = VX_DTYPE_F32) {
   int pipe_fds[2];
   if (pipe(pipe_fds) != 0) {
     return false;
@@ -394,7 +417,7 @@ bool view_bytes_stops_with(int64_t size, int64_t stride, const char *message) {
   }
   if (pid == 0) {
     dup2(pipe_fds[1], STDERR_FILENO);
-    vx_memref_view_bytes(&size, &stride, 1, VX_DTYPE_F32);
+    vx_memref_view_bytes(&size, &stride, 1, elem);
     _exit(0);
   }
   close(pipe_fds[1]);
@@ -412,7 +435,13 @@ bool view_bytes_stops_with(int64_t size, int64_t stride, const char *message) {
          strstr(out, message) != nullptr;
 }
 
-void test_a_negative_stride_stops_the_program() {
+void test_a_broken_view_stops_the_program() {
+  // Code 0 is what the compiler writes for `index` and for any type it does
+  // not know.
+  check(view_bytes_stops_with(4, 1, "the element type code 0", 0),
+        "a view whose element type has no size stops the program");
+  check(view_bytes_stops_with(-1, 1, "has the negative size -1"),
+        "a view with a negative size stops the program");
   check(view_bytes_stops_with(4, -1, "has the negative stride -1"),
         "a view with a negative stride stops the program");
 }
@@ -477,9 +506,9 @@ int main() {
   test_a_generated_kernel_writes_both_host_outputs(sv[0]);
   test_an_output_on_the_worker_stays_there(sv[0]);
   test_a_matmul_fills_a_host_buffer(sv[0]);
-  test_an_empty_view_is_refused(sv[0]);
+  test_an_empty_view_stages_one_element(sv[0]);
   test_a_transposed_view_copies_all_it_reaches(sv[0]);
-  test_a_negative_stride_stops_the_program();
+  test_a_broken_view_stops_the_program();
   test_a_view_whose_span_overflows_stops_the_program();
   // Last, because the code before the fix crashes on it.
   test_a_padded_view_copies_only_what_it_reaches(sv[0]);

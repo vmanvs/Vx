@@ -1383,7 +1383,8 @@ uint64_t vx_plugin_dispatch_async(const void *binary_payload,
     void *allocated;
     void *aligned;
     void *host;
-    size_t bytes;
+    size_t first; // the byte offset of the view's first element
+    size_t bytes; // the bytes the view reaches, from its first element
   };
   // The descriptor argument i refers to, or null. A slot holds a pointer to
   // one.
@@ -1411,23 +1412,26 @@ uint64_t vx_plugin_dispatch_async(const void *binary_payload,
     const int64_t *sizes = vx_memref_sizes(desc);
     const int64_t *strides = vx_memref_strides(desc, rank);
     const int32_t elem = (int32_t)VX_ABI_ELEM(arg_tags[i]);
-    const uint64_t view = vx_memref_view_bytes(sizes, strides, rank, elem);
-    /* Copy from the base, not the first element, so the offset still holds. */
-    const size_t bytes =
-        view ? (size_t)vx_memref_offset(desc) * vx_dtype_bytes(elem) + view : 0;
-    void *host = malloc(bytes ? bytes : 1);
+    const size_t bytes = vx_memref_view_bytes(sizes, strides, rank, elem);
+    /* The host buffer starts at the base, so the offset still holds. Only the
+       view is copied, because another argument can be a view of the same
+       tensor, and a stale copy of its elements must not go back. */
+    const size_t first =
+        bytes ? (size_t)vx_memref_offset(desc) * vx_dtype_bytes(elem) : 0;
+    void *host = malloc(bytes ? first + bytes : 1);
     if (!host) {
       fprintf(stderr,
               "[Vx CUDA] FATAL: out of host memory copying %zu bytes "
               "for %s\n",
-              bytes, kernel_name);
+              first + bytes, kernel_name);
       abort();
     }
     wait_for_kernels("Vx copied a tensor to host memory to run a region on "
                      "the CPU");
-    VX_CUDA_CHECK(cudaMemcpy(host, aligned, bytes, cudaMemcpyDeviceToHost));
+    VX_CUDA_CHECK(cudaMemcpy((char *)host + first, (char *)aligned + first,
+                             bytes, cudaMemcpyDeviceToHost));
     void **ptrs = (void **)desc;
-    copies.push_back({ptrs, ptrs[0], aligned, host, bytes});
+    copies.push_back({ptrs, ptrs[0], aligned, host, first, bytes});
     ptrs[0] = host;
     ptrs[1] = host;
     if (verbose()) {
@@ -1455,8 +1459,9 @@ uint64_t vx_plugin_dispatch_async(const void *binary_payload,
   // A region that ends in an operand publishes that operand's descriptor, so
   // every descriptor still pointing at a copy gets the device memory back.
   for (const HostCopy &c : copies) {
-    VX_CUDA_CHECK(
-        cudaMemcpy(c.aligned, c.host, c.bytes, cudaMemcpyHostToDevice));
+    VX_CUDA_CHECK(cudaMemcpy((char *)c.aligned + c.first,
+                             (char *)c.host + c.first, c.bytes,
+                             cudaMemcpyHostToDevice));
     c.desc[0] = c.allocated;
     c.desc[1] = c.aligned;
     for (int64_t i = 0; i < num_args; ++i) {

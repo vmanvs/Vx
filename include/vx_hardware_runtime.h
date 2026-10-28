@@ -208,27 +208,38 @@ static inline void *vx_memref_data(const void *desc, int32_t dtype) {
 /// correct only for a dense row-major view. A transposed view reaches more
 /// elements, and a view with padded rows reaches fewer.
 ///
-/// Stops the program for a negative stride or a span that does not fit in 64
-/// bits. The compiler makes neither, so the descriptor is broken.
+/// Stops the program for an element type with no size, a negative size, a
+/// negative stride or a span that does not fit in 64 bits. The compiler makes
+/// none of these, so the descriptor is broken.
 static inline uint64_t vx_memref_view_bytes(const int64_t *sizes,
                                             const int64_t *strides,
                                             int32_t rank, int32_t elem) {
   uint64_t last = 0; /* the index of the last element the view reaches */
   uint64_t count, bytes;
+  int empty = 0;
+  if (vx_dtype_bytes(elem) == 0) {
+    fprintf(stderr,
+            "[Vx] FATAL: a tensor view has the element type code %d, which "
+            "has no size\n",
+            elem);
+    abort();
+  }
   for (int32_t d = 0; d < rank; ++d) {
-    if (sizes[d] <= 0) {
-      return 0;
+    if (sizes[d] < 0 || strides[d] < 0) {
+      fprintf(stderr,
+              "[Vx] FATAL: dimension %d of a tensor view has the negative "
+              "%s %lld\n",
+              d, sizes[d] < 0 ? "size" : "stride",
+              (long long)(sizes[d] < 0 ? sizes[d] : strides[d]));
+      abort();
     }
+    empty |= sizes[d] == 0;
+  }
+  if (empty) {
+    return 0;
   }
   for (int32_t d = 0; d < rank; ++d) {
     uint64_t step;
-    if (strides[d] < 0) {
-      fprintf(stderr,
-              "[Vx] FATAL: dimension %d of a tensor view has the negative "
-              "stride %lld\n",
-              d, (long long)strides[d]);
-      abort();
-    }
     if (__builtin_mul_overflow((uint64_t)(sizes[d] - 1), (uint64_t)strides[d],
                                &step) ||
         __builtin_add_overflow(last, step, &last)) {
