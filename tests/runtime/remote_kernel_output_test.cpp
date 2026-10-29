@@ -23,13 +23,15 @@
 //     client must stage exactly one element and must not copy anything back.
 //   * A 3x4 transposed view. The client must copy all 12 elements it reaches.
 //     The same view inside a slot must also copy all 12.
+//   * A 2x4 broadcast view, whose rows are the same 4 elements. The client
+//     must copy exactly those 4.
 //   * A 2x2 view with padded rows. The client must copy only the elements from
 //     the view's first element to its last, in both directions. The view ends
 //     at a page that cannot be read, so a longer copy crashes the test.
 //
 // More cases call vx_memref_view_bytes directly in a child process. A view
-// with an element type that has no size, a negative size, a negative stride,
-// or a span that does not fit in 64 bits must stop the program.
+// with an element type the runtime cannot copy, a negative size, a negative
+// stride, or a span that does not fit in 64 bits must stop the program.
 //
 // The fake worker does not load the image. It runs a fixed function in its
 // place: out1[i] = 2 * in[i] and out2[i] = in[i] + 100. For the views it
@@ -403,9 +405,32 @@ void test_a_transposed_view_copies_all_it_reaches(int fd) {
   check_transposed_view(fd, true);
 }
 
-// Calls vx_memref_view_bytes on a rank-1 view in a child process. Returns true
-// when the child stopped with abort() and printed `message`.
-bool view_bytes_stops_with(int64_t size, int64_t stride, const char *message,
+void test_a_broadcast_view_copies_one_row(int fd) {
+  // A 2x4 view with strides (0, 1) repeats the row data[0..3], as a broadcast
+  // does. The fake worker fails unless it gets exactly those 4 elements. It
+  // doubles each element once per row, so each one comes back 4 times larger.
+  float data[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+  const float after[8] = {4, 8, 12, 16, 5, 6, 7, 8};
+  check(dispatch_view(fd, data, 0, 2, 4, 0, 1) == 1,
+        "the broadcast view's dispatch succeeds");
+  for (int i = 0; i < 8; ++i) {
+    char what[64];
+    snprintf(what, sizeof(what), "broadcast view: element %d == %g", i,
+             (double)after[i]);
+    check(data[i] == after[i], what);
+  }
+}
+
+// The exit code of a child that called abort(). The child catches SIGABRT and
+// exits, so the system writes no crash report or core dump.
+const int kAborted = 86;
+
+void exit_on_abort(int) { _exit(kAborted); }
+
+// Calls vx_memref_view_bytes in a child process. Returns true when the child
+// called abort() and printed `message`.
+bool view_bytes_stops_with(int32_t rank, const int64_t *sizes,
+                           const int64_t *strides, const char *message,
                            int32_t elem = VX_DTYPE_F32) {
   int pipe_fds[2];
   if (pipe(pipe_fds) != 0) {
@@ -416,8 +441,9 @@ bool view_bytes_stops_with(int64_t size, int64_t stride, const char *message,
     return false;
   }
   if (pid == 0) {
+    signal(SIGABRT, exit_on_abort);
     dup2(pipe_fds[1], STDERR_FILENO);
-    vx_memref_view_bytes(&size, &stride, 1, elem);
+    vx_memref_view_bytes(sizes, strides, rank, elem);
     _exit(0);
   }
   close(pipe_fds[1]);
@@ -431,30 +457,50 @@ bool view_bytes_stops_with(int64_t size, int64_t stride, const char *message,
   close(pipe_fds[0]);
   int status = 0;
   waitpid(pid, &status, 0);
-  return WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT &&
+  return WIFEXITED(status) && WEXITSTATUS(status) == kAborted &&
          strstr(out, message) != nullptr;
 }
 
+bool vector_stops_with(int64_t size, int64_t stride, const char *message,
+                       int32_t elem = VX_DTYPE_F32) {
+  return view_bytes_stops_with(1, &size, &stride, message, elem);
+}
+
+void test_a_view_the_runtime_cannot_copy_stops_the_program() {
+  // Code 0 is what the compiler writes for `index`, for pointers and for any
+  // type it does not list. A valid program can make this view.
+  check(vector_stops_with(4, 1,
+                          "cannot copy a tensor with the element type "
+                          "code 0",
+                          0),
+        "a view with element type code 0 stops the program");
+}
+
 void test_a_broken_view_stops_the_program() {
-  // Code 0 is what the compiler writes for `index` and for any type it does
-  // not know.
-  check(view_bytes_stops_with(4, 1, "the element type code 0", 0),
-        "a view whose element type has no size stops the program");
-  check(view_bytes_stops_with(-1, 1, "has the negative size -1"),
+  check(vector_stops_with(-1, 1, "has the negative size -1"),
         "a view with a negative size stops the program");
-  check(view_bytes_stops_with(4, -1, "has the negative stride -1"),
+  check(vector_stops_with(4, -1, "has the negative stride -1"),
         "a view with a negative stride stops the program");
 }
 
 void test_a_view_whose_span_overflows_stops_the_program() {
-  // The last element is at index 2^62 * 4 = 2^64, which does not fit.
-  check(view_bytes_stops_with(((int64_t)1 << 62) + 1, 4,
-                              "spans more than 2^64 elements"),
-        "a view that reaches past element 2^64 stops the program");
+  const int64_t two_62 = (int64_t)1 << 62;
+  // The last element is at index 2^62 * 4 = 2^64. The product overflows.
+  check(vector_stops_with(two_62 + 1, 4, "spans 2^64 elements or more"),
+        "a view whose step reaches element 2^64 stops the program");
+  // Each dimension steps 2 * 2^62 = 2^63, which fits. The sum, 2^64, overflows.
+  const int64_t sizes[2] = {3, 3};
+  const int64_t strides[2] = {two_62, two_62};
+  check(view_bytes_stops_with(2, sizes, strides, "spans 2^64 elements or more"),
+        "a view whose steps add up to element 2^64 stops the program");
+  // The last element is at index (2^32 + 1) * (2^32 - 1) = 2^64 - 1, which
+  // fits. The count of elements, 2^64, does not.
+  check(vector_stops_with(((int64_t)1 << 32) + 2, ((int64_t)1 << 32) - 1,
+                          "spans 2^64 elements or more"),
+        "a view of 2^64 elements stops the program");
   // The last element is at index 2^62, and 2^62 + 1 f32 values need more than
   // 2^64 bytes.
-  check(view_bytes_stops_with(((int64_t)1 << 62) + 1, 1,
-                              "spans more than 2^64 bytes"),
+  check(vector_stops_with(two_62 + 1, 1, "spans 2^64 bytes or more"),
         "a view of more than 2^64 bytes stops the program");
 }
 
@@ -508,6 +554,8 @@ int main() {
   test_a_matmul_fills_a_host_buffer(sv[0]);
   test_an_empty_view_stages_one_element(sv[0]);
   test_a_transposed_view_copies_all_it_reaches(sv[0]);
+  test_a_broadcast_view_copies_one_row(sv[0]);
+  test_a_view_the_runtime_cannot_copy_stops_the_program();
   test_a_broken_view_stops_the_program();
   test_a_view_whose_span_overflows_stops_the_program();
   // Last, because the code before the fix crashes on it.
