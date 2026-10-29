@@ -42,6 +42,24 @@ jobs:
             -o /tmp/remote_kernel_output_test
           /tmp/remote_kernel_output_test
 
+      - name: Build and run the remote client test with clang++, as the reviewer did
+        run: |
+          set -euo pipefail
+          clang++ -std=c++17 -O1 -Wall -Werror \
+            tests/runtime/remote_kernel_output_test.cpp \
+            -o /tmp/remote_kernel_output_test_clang
+          /tmp/remote_kernel_output_test_clang
+
+      - name: Build and link the GPU row-view check (runs only on a machine with a GPU)
+        run: |
+          set -euo pipefail
+          # -rdynamic lets the plugin find the check's region with dlsym.
+          clang++ -std=c++17 -O1 -Wall -Werror ci-checks/row_views_check.cpp \
+            -Iinclude -I/usr/local/cuda/include -o /tmp/row_views_check \
+            -rdynamic -L/tmp -Wl,-rpath,/tmp -lvx_cuda_dispatch \
+            -L/usr/local/cuda/lib64 -Wl,-rpath,/usr/local/cuda/lib64 -lcudart -ldl
+          ls -l /tmp/row_views_check
+
       - name: Show warnings with -Wall (does not fail the job)
         continue-on-error: true
         run: |
