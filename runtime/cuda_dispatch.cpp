@@ -1413,17 +1413,27 @@ uint64_t vx_plugin_dispatch_async(const void *binary_payload,
     const int64_t *strides = vx_memref_strides(desc, rank);
     const int32_t elem = (int32_t)VX_ABI_ELEM(arg_tags[i]);
     const size_t bytes = vx_memref_view_bytes(sizes, strides, rank, elem);
-    /* The host buffer starts at the base, so the offset still holds. Only the
-       view is copied, because another argument can be a view of the same
-       tensor, and a stale copy of its elements must not go back. */
-    const size_t first =
-        bytes ? (size_t)vx_memref_offset(desc) * vx_dtype_bytes(elem) : 0;
-    void *host = malloc(bytes ? first + bytes : 1);
+    /* The host buffer starts at the base, so the offset still holds. The copies
+       cover only the view's span, so views whose spans do not overlap, such as
+       two rows of one tensor, keep each other's writes. */
+    const int64_t offset = vx_memref_offset(desc);
+    size_t first = 0, end = 1;
+    if (bytes &&
+        (offset < 0 ||
+         __builtin_mul_overflow((size_t)offset, vx_dtype_bytes(elem), &first) ||
+         __builtin_add_overflow(first, bytes, &end))) {
+      fprintf(stderr,
+              "[Vx CUDA] FATAL: argument %lld of %s has the offset %lld, and "
+              "its view does not fit in host memory\n",
+              (long long)i, kernel_name, (long long)offset);
+      abort();
+    }
+    void *host = malloc(end);
     if (!host) {
       fprintf(stderr,
               "[Vx CUDA] FATAL: out of host memory copying %zu bytes "
               "for %s\n",
-              first + bytes, kernel_name);
+              end, kernel_name);
       abort();
     }
     wait_for_kernels("Vx copied a tensor to host memory to run a region on "
