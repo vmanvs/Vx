@@ -1,0 +1,56 @@
+name: Throwaway - build cuda_dispatch.cpp and the view copy tests
+
+# Builds only runtime/cuda_dispatch.cpp against the CUDA toolkit, with the
+# command build.rs uses, and the runtime tests that use the changed headers.
+# No GPU, no LLVM, no cargo.
+on:
+  push:
+    branches: [ 'ci/view-copy-follow-ups' ]
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the CUDA toolkit and libffi
+        run: |
+          set -euo pipefail
+          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libffi-dev \
+            cuda-cudart-dev-12-6 libcublas-dev-12-6 cuda-driver-dev-12-6 cuda-nvcc-12-6
+          test -f /usr/local/cuda/include/cuda_runtime.h || sudo ln -sfn /usr/local/cuda-12.6 /usr/local/cuda
+
+      - name: Build cuda_dispatch.cpp as build.rs does
+        run: |
+          set -euo pipefail
+          # This runner's clang 14 defaults to C++14, so say C++17.
+          clang++ -std=c++17 -shared -fPIC runtime/cuda_dispatch.cpp -lffi \
+            -o /tmp/libvx_cuda_dispatch.so -O3 -Wall -Wextra \
+            -I/usr/local/cuda/include -L/usr/local/cuda/lib64 \
+            -Wl,-rpath,/usr/local/cuda/lib64 -lcudart -lcublas -ldl
+
+      - name: Build and run the runtime tests with g++ and clang++
+        run: |
+          set -euo pipefail
+          for cxx in g++ clang++; do
+            for t in view_copy_test remote_kernel_output_test loopback_test transport_test remote_client_test; do
+              $cxx -std=c++17 -O1 -Wall -Werror tests/runtime/$t.cpp -o /tmp/$t-$cxx -lpthread
+            done
+            # remote_client_test needs a real worker and a compiled program, so it is only built.
+            for t in view_copy_test remote_kernel_output_test loopback_test transport_test; do
+              echo "== $t ($cxx)"
+              /tmp/$t-$cxx
+            done
+          done
+
+      - name: Build and link the GPU check (runs only on a machine with a GPU)
+        run: |
+          set -euo pipefail
+          # -rdynamic lets the plugin find the check's region with dlsym.
+          clang++ -std=c++17 -O1 -Wall -Werror ci-checks/gpu_view_copy_check.cpp \
+            -Iinclude -I/usr/local/cuda/include -o /tmp/gpu_view_copy_check \
+            -rdynamic -L/tmp -Wl,-rpath,/tmp -lvx_cuda_dispatch \
+            -L/usr/local/cuda/lib64 -Wl,-rpath,/usr/local/cuda/lib64 -lcudart -ldl
