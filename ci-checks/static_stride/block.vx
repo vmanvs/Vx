@@ -1,0 +1,41 @@
+// A GPU kernel that reads a 64x64 block of a transposed [2, 64, 2, 64] host
+// tensor. Each row of the block starts 128 elements after the one before it,
+// so the block has gaps of 64 elements.
+
+Memory CPU_DRAM {
+  capacity: 480 GiB, bandwidth: 500 GB/s, managed: cached
+}
+
+Memory HBM {
+  capacity: 96 GiB, bandwidth: 4 TB/s, managed: explicit, scope: device
+}
+
+Topology SharedGpu {
+  arch: nvptx64,
+  levels: [blocks(max_lanes: 1024, memory: cta), subgroups(lanes: 32), lanes(memory: thread)],
+  chip: sm_90,
+  memory: Memory::HBM,
+  visible: [Memory::HBM],
+  transfer Memory::CPU_DRAM -> Memory::HBM : 450 GB/s,
+  transfer Memory::HBM -> Memory::CPU_DRAM : 450 GB/s
+}
+
+fn main() -> i32 {
+  let mut m = Tensor<f32, [128, 128]>::fill(0.0);
+  for i in 0..128 {
+    for j in 0..128 {
+      m[i][j] = (i * 128 + j) as f32;
+    }
+  }
+  let t = m.reshape([2, 64, 2, 64]);
+  let p = t.transpose([0, 2, 1, 3]);
+  let v = p[0][1];
+  let mut out = Tensor<f32, [64]>::fill(0.0);
+  spawn on(Topology::SharedGpu) {
+    for i in 0..64 across blocks {
+      out[i] = v[i][3];
+    }
+  }
+  println!("{}", out[40]);
+  return 0;
+}

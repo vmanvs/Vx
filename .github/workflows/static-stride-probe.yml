@@ -1,0 +1,75 @@
+name: Throwaway - kernel arguments with static strides
+
+# Builds vxc and prints, for each program in ci-checks/static_stride, the
+# outlined kernel's argument types and its LLVM code. The question: does a
+# kernel argument keep static strides from its type, so that the kernel
+# ignores the strides in the descriptor? No tests, no GPU.
+on:
+  push:
+    branches: [ 'probe/static-stride-views' ]
+
+env:
+  VX_VERSION_WITH_COMMIT: 1
+
+jobs:
+  llvm:
+    name: Build LLVM
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    outputs:
+      key: ${{ steps.llvm.outputs.key }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build LLVM if the cache does not have it
+        id: llvm
+        uses: ./.github/actions/build-own-llvm
+        with:
+          restore: 'false'
+
+  probe:
+    name: Print the kernels
+    needs: llvm
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: "-C link-arg=-fuse-ld=lld"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ needs.llvm.outputs.key }}
+      - name: Use our own LLVM
+        uses: ./.github/actions/use-own-llvm
+        with:
+          key: ${{ needs.llvm.outputs.key }}
+
+      - name: Build vxc
+        run: cargo build --release --bin vxc 2>&1 | tail -n 20
+
+      - name: Print the kernels
+        run: |
+          mkdir -p out
+          for f in ci-checks/static_stride/*.vx; do
+            name=$(basename "$f" .vx)
+            echo "::group::$name: --run (no GPU, so the kernel runs on the host)"
+            ./target/release/vxc "$f" --run 2>&1 | tail -n 5 || true
+            echo "::endgroup::"
+            ./target/release/vxc "$f" --action emit-mlir > "out/$name.mlir" 2>&1 || true
+            ./target/release/vxc "$f" --action emit-llvm -o /dev/null > "out/$name.ll" 2>&1 || true
+            echo "::group::$name: views and kernel signatures in the MLIR"
+            grep -nE 'func.func|gpu.func|vx.spawn|strided<|reinterpret_cast|subview|Error' "out/$name.mlir" || true
+            echo "::endgroup::"
+            echo "::group::$name: errors and kernel signatures in the LLVM dialect"
+            grep -nE 'Error|llvm.func' "out/$name.ll" || true
+            echo "::endgroup::"
+            echo "::group::$name: the kernel functions in the LLVM dialect"
+            awk '/llvm.func/{p = ($0 ~ /kernel/)} p{print}' "out/$name.ll"
+            echo "::endgroup::"
+          done
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: static-stride-probe
+          path: out/

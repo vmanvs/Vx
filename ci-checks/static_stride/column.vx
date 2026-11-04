@@ -1,0 +1,39 @@
+// A GPU kernel that reads one column of a 64x64 host tensor: a row of its
+// transpose. The column has gaps of 63 elements between its elements.
+
+Memory CPU_DRAM {
+  capacity: 480 GiB, bandwidth: 500 GB/s, managed: cached
+}
+
+Memory HBM {
+  capacity: 96 GiB, bandwidth: 4 TB/s, managed: explicit, scope: device
+}
+
+Topology SharedGpu {
+  arch: nvptx64,
+  levels: [blocks(max_lanes: 1024, memory: cta), subgroups(lanes: 32), lanes(memory: thread)],
+  chip: sm_90,
+  memory: Memory::HBM,
+  visible: [Memory::HBM],
+  transfer Memory::CPU_DRAM -> Memory::HBM : 450 GB/s,
+  transfer Memory::HBM -> Memory::CPU_DRAM : 450 GB/s
+}
+
+fn main() -> i32 {
+  let mut m = Tensor<f32, [64, 64]>::fill(0.0);
+  for i in 0..64 {
+    for j in 0..64 {
+      m[i][j] = (i * 64 + j) as f32;
+    }
+  }
+  let t = m.transpose([1, 0]);
+  let col = t[3];
+  let mut out = Tensor<f32, [64]>::fill(0.0);
+  spawn on(Topology::SharedGpu) {
+    for i in 0..64 across blocks {
+      out[i] = col[i];
+    }
+  }
+  println!("{}", out[40]);
+  return 0;
+}
